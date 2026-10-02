@@ -13609,6 +13609,183 @@ verified in {SYSTEM}
       
       // ====== EMS Mapper SQLite Loader ======
       // ====== EMS Mapper SQLite Loader ======
+      // ----- Shared SQLite file (File System Access API; Chrome/Edge only) -----
+      // Keep this block identical in Frostbyte.html and EMS_Mapper_Tool.html.
+      const SharedDb = (() => {
+        const IDB_NAME = 'FrostbyteSharedDb';
+        const IDB_STORE = 'handles';
+        const IDB_KEY = 'sharedFile';
+        const SQL_BASE = 'https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.8.0/';
+        const PICKER_TYPES = [{ description: 'SQLite database', accept: { 'application/x-sqlite3': ['.sqlite', '.sqlite3', '.db'] } }];
+        const BATCH_LIMIT = 25;
+        const BATCH_DELAY_MS = 1500;
+
+        let handle = null;
+        let ready = false;
+        let lastModified = 0;
+        let sqlPromise = null;
+        let queue = [];
+        let chain = Promise.resolve();
+        let active = 0;
+        let timer = null;
+        let onError = () => {};
+
+        function openIdb() {
+          return new Promise((resolve, reject) => {
+            const req = indexedDB.open(IDB_NAME, 1);
+            req.onupgradeneeded = () => req.result.createObjectStore(IDB_STORE);
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error);
+          });
+        }
+
+        async function idbRun(mode, op) {
+          const idb = await openIdb();
+          return new Promise((resolve, reject) => {
+            const req = op(idb.transaction(IDB_STORE, mode).objectStore(IDB_STORE));
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error);
+          });
+        }
+
+        function getSQL() {
+          if (!sqlPromise) {
+            sqlPromise = (async () => {
+              while (typeof initSqlJs === 'undefined') await new Promise(r => setTimeout(r, 100));
+              return initSqlJs({ locateFile: f => SQL_BASE + f });
+            })();
+          }
+          return sqlPromise;
+        }
+
+        async function ensurePermission(prompt) {
+          if (!handle) return false;
+          const opts = { mode: 'readwrite' };
+          let p = await handle.queryPermission(opts);
+          if (p !== 'granted' && prompt) p = await handle.requestPermission(opts);
+          ready = p === 'granted';
+          return ready;
+        }
+
+        async function restore() {
+          if (!window.showOpenFilePicker) return 'unsupported';
+          try { handle = (await idbRun('readonly', s => s.get(IDB_KEY))) || null; } catch (e) { handle = null; }
+          if (!handle) return 'none';
+          return (await ensurePermission(false)) ? 'ready' : 'needs-permission';
+        }
+
+        async function link() {
+          const [h] = await window.showOpenFilePicker({ types: PICKER_TYPES, multiple: false });
+          handle = h;
+          await idbRun('readwrite', s => s.put(h, IDB_KEY));
+          return ensurePermission(true);
+        }
+
+        async function create(bytes) {
+          const h = await window.showSaveFilePicker({ suggestedName: 'EMS_Scanner_DB.sqlite', types: PICKER_TYPES });
+          handle = h;
+          await idbRun('readwrite', s => s.put(h, IDB_KEY));
+          if (!(await ensurePermission(true))) return false;
+          await writeBytes(bytes);
+          return true;
+        }
+
+        async function unlink() {
+          handle = null;
+          ready = false;
+          queue = [];
+          await idbRun('readwrite', s => s.delete(IDB_KEY));
+        }
+
+        async function readBytes() {
+          const file = await handle.getFile();
+          lastModified = file.lastModified;
+          return new Uint8Array(await file.arrayBuffer());
+        }
+
+        async function writeBytes(bytes) {
+          const w = await handle.createWritable();
+          await w.write(bytes);
+          await w.close();
+          lastModified = (await handle.getFile()).lastModified;
+        }
+
+        async function hasChanged() {
+          return (await handle.getFile()).lastModified !== lastModified;
+        }
+
+        // Serializes writers across tabs; falls back to no lock where Web Locks is blocked (file://).
+        async function withLock(fn) {
+          if (navigator.locks) {
+            try { return await navigator.locks.request('frostbyte-shared-db', fn); }
+            catch (e) { if (e.name !== 'SecurityError') throw e; }
+          }
+          return fn();
+        }
+
+        async function runFlush() {
+          if (!queue.length) return null;
+          const batch = queue;
+          queue = [];
+          active++;
+          try {
+            return await withLock(async () => {
+              const SQL = await getSQL();
+              const db = new SQL.Database(await readBytes());
+              try {
+                batch.forEach(fn => fn(db));
+                const bytes = db.export();
+                await writeBytes(bytes);
+                return bytes;
+              } finally {
+                db.close();
+              }
+            });
+          } catch (e) {
+            queue = batch.concat(queue);
+            if (e && e.name === 'NotAllowedError') ready = false;
+            throw e;
+          } finally {
+            active--;
+          }
+        }
+
+        function flush() {
+          clearTimeout(timer);
+          timer = null;
+          const p = chain.catch(() => {}).then(runFlush);
+          chain = p;
+          return p;
+        }
+
+        // Each fn runs against a freshly re-read copy of the file, so edits from the other page are preserved.
+        function enqueue(fn) {
+          queue.push(fn);
+          if (queue.length >= BATCH_LIMIT) {
+            flush().catch(onError);
+          } else if (!timer) {
+            timer = setTimeout(() => flush().catch(onError), BATCH_DELAY_MS);
+          }
+        }
+
+        // Returns the resulting file bytes even when another batch already applied this fn.
+        async function mutate(fn) {
+          queue.push(fn);
+          return (await flush()) || readBytes();
+        }
+
+        return {
+          getSQL, restore, link, create, unlink, readBytes, writeBytes, hasChanged, enqueue, flush, mutate,
+          reconnect: () => ensurePermission(true),
+          isSupported: () => !!window.showOpenFilePicker,
+          isLinked: () => !!handle,
+          isReady: () => !!handle && ready,
+          hasPending: () => queue.length > 0 || active > 0,
+          fileName: () => (handle ? handle.name : ''),
+          setErrorHandler: (fn) => { onError = fn; }
+        };
+      })();
+
       function setupEmsSqliteLoader() {
          const emsSection = document.getElementById("ems-mapper");
          if(!emsSection) return;
@@ -13619,6 +13796,15 @@ verified in {SYSTEM}
                <p style="font-size:12px; color:#aaa;" id="sqlite-status-text">Select the EMS_Scanner_DB.sqlite file exported from the Scanner Tool to overwrite cache.</p>
                <input type="file" id="sqlite-upload" accept=".sqlite,.db" style="display:block; margin: 10px 0;">
                <button class="primary-button" id="download-updated-db" style="display:none; margin-top:10px;">💾 Download Updated Database</button>
+               <div style="margin-top:15px; padding-top:10px; border-top:1px solid #444;">
+                  <h4>Shared Database File</h4>
+                  <p style="font-size:12px; color:#aaa;" id="shared-db-status"></p>
+                  <button class="primary-button" id="shared-link-btn" style="margin-top:5px;">🔗 Link Existing File</button>
+                  <button class="primary-button" id="shared-create-btn" style="margin-top:5px;">🆕 Create File From Current DB</button>
+                  <button class="primary-button" id="shared-reconnect-btn" style="display:none; margin-top:5px;">🔓 Reconnect</button>
+                  <button class="danger-button" id="shared-unlink-btn" style="display:none; margin-top:5px;">Unlink</button>
+                  <p style="font-size:12px; color:#aaa;">Use the same file in EMS_Mapper_Tool.html so both tools share one database.</p>
+               </div>
             </div>
          `;
          emsSection.insertAdjacentHTML('afterbegin', loaderHtml);
@@ -13675,6 +13861,16 @@ verified in {SYSTEM}
          setTimeout(async () => {
              if(typeof initSqlJs !== 'undefined') {
                  try {
+                     const sharedState = await SharedDb.restore();
+                     if (sharedState === 'ready') {
+                         await loadFromShared();
+                         updateSharedUi();
+                         return;
+                     }
+                     if (sharedState === 'needs-permission') {
+                         showNotification("Shared database needs access again. Open Settings > EMS Mapper and click Reconnect.", "info", 6000);
+                     }
+                     updateSharedUi();
                      const savedData = await loadFromIndexedDB();
                      if (savedData) {
                          const SQL = await initSqlJs({ locateFile: () => "https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.8.0/sql-wasm.wasm" });
@@ -13703,6 +13899,10 @@ verified in {SYSTEM}
                  
                  // Save to indexedDB for next reload
                  await saveToIndexedDB(Uint8ArrayData);
+                 if (SharedDb.isReady()) {
+                     try { await SharedDb.writeBytes(Uint8ArrayData); }
+                     catch (err) { showNotification("Could not write the shared database file.", "error"); }
+                 }
                  
                  showNotification("SQLite Database Loaded and Cached Successfully!");
                  document.getElementById("download-updated-db").style.display = "inline-block";
@@ -13728,39 +13928,274 @@ verified in {SYSTEM}
              setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 100);
          });
 
-         window.addEventListener('opusClassified', async (e) => {
-             console.log('opusClassified event received', e.detail);
-             if(!window.mainDB) {
-                 console.log('mainDB is null, aborting');
+         // ----- Shared database file -----
+
+         async function loadFromShared() {
+             const bytes = await SharedDb.readBytes();
+             if (bytes.length === 0) {
+                 // A brand new empty file is seeded from the current database.
+                 if (window.mainDB) await SharedDb.writeBytes(window.mainDB.export());
                  return;
              }
-             const { storeId, rackName, emsType } = e.detail;
+             const SQL = await SharedDb.getSQL();
+             window.mainDB = new SQL.Database(bytes);
+             await saveToIndexedDB(bytes);
+             document.getElementById("download-updated-db").style.display = "inline-block";
+             document.getElementById("sqlite-status-text").innerText = "Database loaded from the shared file.";
+             window.dispatchEvent(new CustomEvent('emsDbLoaded', { detail: { db: window.mainDB } }));
+             if (typeof renderEmsTable === 'function') renderEmsTable();
+             if (typeof updateEmsInsightsPanel === 'function') updateEmsInsightsPanel();
+         }
+
+         async function syncFromShared() {
+             if (!SharedDb.isReady() || SharedDb.hasPending()) return;
              try {
-                 window.mainDB.run("UPDATE Racks SET ems_type = ?, needs_review = 0 WHERE store_id = ? AND UPPER(rack_name) = UPPER(?)", [emsType, storeId, rackName]);
-                   console.log("Executed SQL update for", rackName);
-                 showNotification(`Updated ${rackName} to ${emsType} in Database!`, "success");
-                 // Re-cache mutated DB
-                 const exported = window.mainDB.export();
-                 await saveToIndexedDB(exported);
-
-                   if (window.frostbyteEmsMapping && frostbyteEmsMapping[storeId] && frostbyteEmsMapping[storeId].racks && frostbyteEmsMapping[storeId].racks[rackName]) {
-                       frostbyteEmsMapping[storeId].racks[rackName].system = emsType;
-                       saveEmsData();
-                   }
-                   console.log("Cached successfully");
-
-                 
-                 // Explicitly set the DOM label so the UI looks active
-                 const labelBox = document.getElementById("selected-system-label");
-                 if(labelBox) labelBox.innerText = emsType;
-                 
-                 // Immediately re-render panels to reflect the new system type
-                 if (typeof renderEmsTable === 'function') renderEmsTable();
-                 if (typeof updateEmsInsightsPanel === 'function') updateEmsInsightsPanel();
-             } catch(err) {
-                 console.error("SQL Error", err);
+                 if (await SharedDb.hasChanged()) {
+                     await loadFromShared();
+                     showNotification("Shared database reloaded (changed by another page).", "info", 2500);
+                 }
+             } catch (err) {
+                 console.warn("Shared database check failed", err);
              }
+         }
+
+         function updateSharedUi() {
+             const status = document.getElementById("shared-db-status");
+             if (!status) return;
+             const show = (id, visible) => { document.getElementById(id).style.display = visible ? "inline-block" : "none"; };
+
+             if (!SharedDb.isSupported()) {
+                 status.textContent = "This browser does not support shared files (use Chrome or Edge). Using browser storage only.";
+                 show("shared-link-btn", false); show("shared-create-btn", false); show("shared-reconnect-btn", false); show("shared-unlink-btn", false);
+                 return;
+             }
+             if (SharedDb.isReady()) status.textContent = `Linked: ${SharedDb.fileName()} (read/write)`;
+             else if (SharedDb.isLinked()) status.textContent = `Linked: ${SharedDb.fileName()} - access must be re-granted.`;
+             else status.textContent = "Not linked. Using browser storage only.";
+
+             show("shared-link-btn", !SharedDb.isLinked());
+             show("shared-create-btn", !SharedDb.isLinked());
+             show("shared-reconnect-btn", SharedDb.isLinked() && !SharedDb.isReady());
+             show("shared-unlink-btn", SharedDb.isLinked());
+         }
+
+         document.getElementById("shared-link-btn").addEventListener("click", async () => {
+             try {
+                 if (!(await SharedDb.link())) {
+                     showNotification("Access to the shared file was not granted.", "error");
+                 } else {
+                     await loadFromShared();
+                     showNotification(`Linked shared database ${SharedDb.fileName()}.`, "success");
+                 }
+             } catch (err) {
+                 if (err.name !== "AbortError") showNotification(`Linking failed: ${err.message}`, "error", 5000);
+             }
+             updateSharedUi();
          });
+
+         document.getElementById("shared-create-btn").addEventListener("click", async () => {
+             if (!window.mainDB) {
+                 showNotification("Load a database first, or link an existing file.", "error");
+                 return;
+             }
+             try {
+                 if (await SharedDb.create(window.mainDB.export())) {
+                     showNotification(`Created shared database ${SharedDb.fileName()}.`, "success");
+                 }
+             } catch (err) {
+                 if (err.name !== "AbortError") showNotification(`Creating file failed: ${err.message}`, "error", 5000);
+             }
+             updateSharedUi();
+         });
+
+         document.getElementById("shared-reconnect-btn").addEventListener("click", async () => {
+             try {
+                 if (await SharedDb.reconnect()) {
+                     await SharedDb.flush();
+                     await loadFromShared();
+                     showNotification("Shared database reconnected.", "success");
+                 }
+             } catch (err) {
+                 showNotification(`Reconnect failed: ${err.message}`, "error", 5000);
+             }
+             updateSharedUi();
+         });
+
+         document.getElementById("shared-unlink-btn").addEventListener("click", async () => {
+             await SharedDb.unlink();
+             showNotification("Shared database unlinked.", "info");
+             updateSharedUi();
+         });
+
+         document.addEventListener("visibilitychange", () => { if (!document.hidden) syncFromShared(); });
+         window.addEventListener("focus", syncFromShared);
+         updateSharedUi();
+
+         // Applies a change to the shared file when linked (replacing mainDB with the merged result), else locally.
+         async function commitDb(fn) {
+             if (SharedDb.isReady()) {
+                 try {
+                     const bytes = await SharedDb.mutate(fn);
+                     const SQL = await SharedDb.getSQL();
+                     window.mainDB = new SQL.Database(bytes);
+                     await saveToIndexedDB(bytes);
+                     return;
+                 } catch (err) {
+                     console.error("Shared DB write failed", err);
+                     showNotification("Shared database write failed. Click Reconnect in settings to retry.", "error", 5000);
+                     updateSharedUi();
+                 }
+             }
+             fn(window.mainDB);
+             await saveToIndexedDB(window.mainDB.export());
+         }
+
+         // ----- Opus Architect / Magnum classification -----
+
+         function normalizeOpusType(type) {
+             return /mag/i.test(type) ? "Opus Magnum" : "Opus Architect";
+         }
+
+         // Resolves to the checked rack names, or null when the user skips.
+         function showOpusSiblingModal(type, currentRack, racks) {
+             const opposite = type === "Opus Magnum" ? "Opus Architect" : "Opus Magnum";
+             return new Promise((resolve) => {
+                 const overlay = document.createElement("div");
+                 overlay.className = "modal-overlay";
+                 const content = document.createElement("div");
+                 content.className = "modal-content";
+                 content.style.maxWidth = "460px";
+
+                 const header = document.createElement("div");
+                 header.className = "modal-header";
+                 header.textContent = `Other racks on ${type}`;
+
+                 const body = document.createElement("div");
+                 body.className = "modal-body";
+                 const intro = document.createElement("p");
+                 intro.style.margin = "0 0 8px 0";
+                 intro.textContent = `${currentRack} is on ${type}. Which other OPUS racks at this site are also on ${type}?`;
+                 const note = document.createElement("p");
+                 note.style.cssText = "margin:0 0 10px 0; font-size:0.9em; opacity:0.8;";
+                 note.textContent = `Unchecked racks will be set to ${opposite}.`;
+                 body.appendChild(intro);
+                 body.appendChild(note);
+
+                 const boxes = racks.map((name) => {
+                     const label = document.createElement("label");
+                     label.style.cssText = "display:flex; align-items:center; gap:8px; padding:4px 0; cursor:pointer;";
+                     const box = document.createElement("input");
+                     box.type = "checkbox";
+                     box.value = name;
+                     label.appendChild(box);
+                     label.appendChild(document.createTextNode(name));
+                     body.appendChild(label);
+                     return box;
+                 });
+
+                 const buttons = document.createElement("div");
+                 buttons.className = "modal-buttons";
+                 const allBtn = document.createElement("button");
+                 allBtn.className = "modal-btn modal-btn-secondary";
+                 allBtn.textContent = "Select all";
+                 allBtn.onclick = () => boxes.forEach((b) => { b.checked = true; });
+                 const skipBtn = document.createElement("button");
+                 skipBtn.className = "modal-btn modal-btn-secondary";
+                 skipBtn.textContent = `Only ${currentRack}`;
+                 const applyBtn = document.createElement("button");
+                 applyBtn.className = "modal-btn modal-btn-primary";
+                 applyBtn.textContent = "Apply";
+                 buttons.appendChild(allBtn);
+                 buttons.appendChild(skipBtn);
+                 buttons.appendChild(applyBtn);
+
+                 content.appendChild(header);
+                 content.appendChild(body);
+                 content.appendChild(buttons);
+                 overlay.appendChild(content);
+
+                 const onKey = (ev) => { if (ev.key === "Escape") close(null); };
+                 function close(result) {
+                     document.removeEventListener("keydown", onKey);
+                     overlay.classList.remove("show");
+                     setTimeout(() => overlay.remove(), 200);
+                     resolve(result);
+                 }
+                 skipBtn.onclick = () => close(null);
+                 applyBtn.onclick = () => close(boxes.filter((b) => b.checked).map((b) => b.value));
+                 overlay.onclick = (ev) => { if (ev.target === overlay) close(null); };
+                 document.addEventListener("keydown", onKey);
+
+                 document.body.appendChild(overlay);
+                 setTimeout(() => overlay.classList.add("show"), 10);
+             });
+         }
+
+         async function resolveOpusClassification({ storeId, rackName, emsType }) {
+             if (!window.mainDB) return;
+             const current = rackName && rackName !== "Unknown" ? String(rackName).trim() : "";
+             if (!current) return;
+
+             const type = normalizeOpusType(emsType);
+             const opposite = type === "Opus Magnum" ? "Opus Architect" : "Opus Magnum";
+
+             let pending = [];
+             try {
+                 const exists = window.mainDB.exec("SELECT 1 FROM Racks WHERE store_id = ? AND UPPER(rack_name) = UPPER(?)", [storeId, current]);
+                 if (exists.length === 0) return;
+                 const res = window.mainDB.exec(
+                     "SELECT rack_name FROM Racks WHERE store_id = ? AND needs_review = 1 AND UPPER(ems_type) = 'OPUS' AND UPPER(rack_name) <> UPPER(?) ORDER BY rack_name",
+                     [storeId, current]
+                 );
+                 if (res.length > 0) pending = res[0].values.map((r) => r[0]);
+             } catch (err) {
+                 console.error("Opus rack lookup failed", err);
+                 return;
+             }
+
+             const sameSystem = pending.length > 0 ? await showOpusSiblingModal(type, current, pending) : null;
+
+             const assignments = [[current, type]];
+             if (sameSystem) {
+                 pending.forEach((name) => assignments.push([name, sameSystem.includes(name) ? type : opposite]));
+             }
+
+             try {
+                 await commitDb((d) => {
+                     assignments.forEach(([name, t]) => {
+                         d.run("UPDATE Racks SET ems_type = ?, needs_review = 0 WHERE store_id = ? AND UPPER(rack_name) = UPPER(?)", [t, storeId, name]);
+                     });
+                 });
+             } catch (err) {
+                 console.error("SQL Error", err);
+                 showNotification("Failed to update rack types.", "error");
+                 return;
+             }
+
+             const byType = {};
+             assignments.forEach(([name, t]) => { (byType[t] = byType[t] || []).push(name); });
+             showNotification(Object.entries(byType).map(([t, names]) => `${names.join(", ")} → ${t}`).join("; "), "success", 5000);
+
+             // The legacy JSON mapping keeps the short button names (Opus Arch / Opus Mag).
+             const legacyRacks = frostbyteEmsMapping[storeId] && frostbyteEmsMapping[storeId].racks;
+             if (legacyRacks) {
+                 let legacyChanged = false;
+                 assignments.forEach(([name, t]) => {
+                     const key = Object.keys(legacyRacks).find((k) => k.toUpperCase() === name.toUpperCase());
+                     if (key) { legacyRacks[key].system = t === "Opus Magnum" ? "Opus Mag" : "Opus Arch"; legacyChanged = true; }
+                 });
+                 if (legacyChanged) saveEmsData();
+             }
+
+             // Explicitly set the DOM label so the UI looks active
+             const labelBox = document.getElementById("selected-system-label");
+             if (labelBox) labelBox.innerText = emsType;
+
+             if (typeof renderEmsTable === 'function') renderEmsTable();
+             if (typeof updateEmsInsightsPanel === 'function') updateEmsInsightsPanel();
+         }
+
+         window.addEventListener('opusClassified', (e) => { resolveOpusClassification(e.detail); });
       }
 
       document.addEventListener("DOMContentLoaded", setupEmsSqliteLoader);

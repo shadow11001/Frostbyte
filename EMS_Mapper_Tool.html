@@ -4,6 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>EMS Mapper Custom Tool</title>
+    <!-- Use SQL.js for SQLite in WebAssembly -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.8.0/sql-wasm.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol"; padding: 20px; background: #1e1e1e; color: #fff; }
         .ems-mapper-container { background: #2d2d2d; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); max-width: 1000px; margin: 0 auto; }
@@ -32,351 +35,1689 @@
         .form-group input { width: 100%; box-sizing: border-box; }
         .action-button { background: transparent; border: 1px solid #666; color: #ccc; padding: 4px 8px; margin-right: 5px; border-radius: 3px; cursor: pointer; }
         .action-button:hover { background: #444; color: #fff; }
+
+        /* Progress Bar */
+        .progress-container { width: 100%; background-color: #444; border-radius: 4px; margin: 15px 0; overflow: hidden; display: none; }
+        .progress-bar { width: 0%; height: 20px; background-color: #007acc; text-align: center; line-height: 20px; color: white; transition: width 0.3s; }
+        
+        .log-container { background: #111; color: #0f0; padding: 10px; font-family: monospace; height: 150px; overflow-y: scroll; border-radius: 4px; display: none; margin-top: 15px;}
+        .log-error { color: #f55; }
+        .log-warn { color: #fd0; }
+        .log-info { color: #0af; }
+        
+        .tabs { display: flex; border-bottom: 1px solid #444; margin-bottom: 15px; }
+        .tab { padding: 10px 20px; cursor: pointer; background: #2d2d2d; color: #aaa; border: none; font-size: 16px; outline: none; }
+        .tab:hover { color: #fff; background: #333; }
+        .tab.active { color: #fff; border-bottom: 2px solid #007acc; font-weight: bold; }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-top: 20px;
+        }
+        .chart-card {
+            background-color: #2d2d2d;
+            border-radius: 8px;
+            padding: 15px;
+            border: 1px solid #444;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        .chart-card h3 {
+            margin-top: 0;
+            margin-bottom: 15px;
+            font-size: 1.1em;
+            text-align: center;
+            color: #ddd;
+        }
+        .panel-card { background: #333; border: 1px solid #444; border-radius: 8px; padding: 12px 15px; margin-top: 15px; }
+        .panel-card h3 { margin: 0 0 8px 0; font-size: 1.05em; color: #ddd; }
+        .panel-card .hint { color: #aaa; font-size: 12px; margin: 6px 0 0 0; }
     </style>
 </head>
 <body>
 
 <div class="ems-mapper-container">
-    <h2>🗺️ EMS Mapper</h2>
-    <div class="ems-controls">
-        <input type="text" id="ems-search" placeholder="Search stores..." class="form-control" style="width: 200px" oninput="renderEmsTable()" />
-        <button class="primary-button" onclick="openEmsModal()">+ Add New Store</button>
-        <button class="secondary-button" onclick="exportEmsData()">📥 Export Data</button>
-        <button class="danger-button" onclick="clearEmsData()">🗑️ Clear Data</button>
+    <h2>🗺️ EMS Mapper Scanner</h2>
+    
+    <div class="tabs">
+        <button class="tab active" onclick="switchTab(event, 'scannerTab')">Scanner</button>
+        <button class="tab" onclick="switchTab(event, 'dataTab')">View Data</button>
+        <button class="tab" id="reviewCountTab" onclick="switchTab(event, 'reviewTab')" style="display:none">Needs Review (0)</button>
+        <button class="tab" onclick="switchTab(event, 'statsTab')">Dashboard</button>
     </div>
-    <div class="table-container" style="overflow-x: auto">
-        <table class="ems-table" id="ems-table">
-            <thead>
-                <tr>
-                    <th>Store #</th>
-                    <th>EMS System</th>
-                    <th>Rack</th>
-                    <th>Actions</th>
-                </tr>
-            </thead>
-            <tbody>
-                <!-- Dynamic rows -->
-            </tbody>
-        </table>
-    </div>
-</div>
 
-<!-- Add/Edit Modal -->
-<div id="emsModal" class="modal">
-    <div class="modal-content">
-        <span class="close-modal" onclick="closeEmsModal()">&times;</span>
-        <h3 id="modalTitle" style="margin-top: 0;">Add Store EMS Map</h3>
-
-        <div class="form-group">
-            <label for="modalStoreId">Store Number:</label>
-            <input type="text" id="modalStoreId" class="form-control" placeholder="e.g. 1234">
+    <!-- Scanner Tab -->
+    <div id="scannerTab" class="tab-content active">
+        <div class="ems-controls">
+            <input type="number" id="start-store" placeholder="Start (1)" class="form-control" style="width: 100px" value="1" />
+            <input type="number" id="end-store" placeholder="End (9999)" class="form-control" style="width: 100px" value="9999" />
+            <label style="display: flex; align-items: center; gap: 5px;">
+                <input type="checkbox" id="rescan-missing"> Rescan Nonexistent
+            </label>
+            <button class="primary-button" id="start-scan-btn" onclick="startScan()">Start Scan</button>
+            <button class="danger-button" id="stop-scan-btn" onclick="stopScan()" style="display:none">Stop Scan</button>
         </div>
-
-        <div class="form-group">
-            <label for="modalEmsType">EMS System:</label>
-            <select id="modalEmsType" class="form-control">
-                <option value="">Select EMS System...</option>
-                <option value="Novar ESS32">Novar ESS32</option>
-                <option value="Opus Architect">Opus Architect</option>
-                <option value="Opus Magnum">Opus Magnum</option>
-                <option value="CPC UltraSite">CPC UltraSite</option>
-                <option value="Connect+">Connect+</option>
-                <option value="Danfoss AKA65">Danfoss AKA65</option>
-                <option value="Danfoss Store View">Danfoss Store View</option>
-                <option value="Carel">Carel</option>
-            </select>
-        </div>
-
         
-        <div class="form-group" style="background:#3d3d3d; padding:15px; border-radius:5px; margin-top:15px;">
-            <label style="margin-bottom:10px; display:block; color:#fff;">Rack Quick Builder (Click to build name)</label>
-            <div id="builder-controls">
-                <div style="display:flex; gap:5px; flex-wrap:wrap; margin-bottom:10px;" id="prefix-btns"></div>
-                <div style="display:flex; gap:5px; flex-wrap:wrap; margin-bottom:10px;" id="type-btns"></div>
-                <div style="display:flex; gap:5px; flex-wrap:wrap; margin-bottom:10px;" id="letter-btns"></div>
+        <div class="progress-container" id="progress-wrapper">
+            <div class="progress-bar" id="scan-progress">0%</div>
+        </div>
+        
+        <div id="current-scan-status" style="margin-bottom: 15px; color: #aaa;"></div>
+        
+        <div class="log-container" id="scan-log"></div>
+
+        <div class="panel-card" id="shared-db-card">
+            <h3>Shared Database File</h3>
+            <div id="shared-db-status" style="color:#aaa; margin-bottom:10px;"></div>
+            <div class="ems-controls" style="margin-bottom:0; flex-wrap:wrap;">
+                <button class="secondary-button" id="shared-link-btn" onclick="sharedDbLink()">🔗 Link Existing File</button>
+                <button class="secondary-button" id="shared-create-btn" onclick="sharedDbCreate()">🆕 Create File From Current DB</button>
+                <button class="primary-button" id="shared-reconnect-btn" onclick="sharedDbReconnect()" style="display:none">🔓 Reconnect</button>
+                <button class="danger-button" id="shared-unlink-btn" onclick="sharedDbUnlink()" style="display:none">Unlink</button>
             </div>
+            <p class="hint">Link the same file in Frostbyte.html so both tools read and write one database. Browsers ask for access again after a restart.</p>
+        </div>
+
+        <div class="panel-card" id="schedule-card">
+            <h3>Scheduled Scan</h3>
+            <div class="ems-controls" style="margin-bottom:0; flex-wrap:wrap;">
+                <select id="sched-mode" class="form-control" onchange="saveSchedule()">
+                    <option value="off">Off</option>
+                    <option value="daily">Nightly / Daily</option>
+                    <option value="weekly">Weekly</option>
+                </select>
+                <select id="sched-day" class="form-control" onchange="saveSchedule()">
+                    <option value="0">Sunday</option>
+                    <option value="1">Monday</option>
+                    <option value="2">Tuesday</option>
+                    <option value="3">Wednesday</option>
+                    <option value="4">Thursday</option>
+                    <option value="5">Friday</option>
+                    <option value="6">Saturday</option>
+                </select>
+                <input type="time" id="sched-time" class="form-control" value="02:00" onchange="saveSchedule()" />
+            </div>
+            <div id="sched-status" style="color:#aaa; margin-top:10px;"></div>
+            <p class="hint">Rescans previously found stores only. Runs only while this tab is open; a missed run starts when the page is next open. Needs the Tampermonkey proxy.</p>
+        </div>
+    </div>
+
+    <div id="dataTab" class="tab-content">
+        <div class="ems-controls">
+            <input type="number" id="filter-start" placeholder="Start Store" class="form-control" style="width: 120px" oninput="renderEmsTable()" />
+            <span style="color:#aaa">to</span>
+            <input type="number" id="filter-end" placeholder="End Store" class="form-control" style="width: 120px" oninput="renderEmsTable()" />
             
-            <div style="display:flex; gap:10px; margin-top:15px;">
-                <input type="text" id="builderResult" class="form-control" placeholder="Rack Code (e.g. LTA)" style="flex:1;">
-                <button type="button" class="primary-button" onclick="addBuiltRack()">Add Rack to List &darr;</button>
-                <button type="button" class="danger-button" onclick="clearRackBuilder()">Clear</button>
+            <input type="text" id="ems-search" placeholder="Search..." class="form-control" style="width: 150px; margin-left: 10px;" oninput="renderEmsTable()" />
+            
+            <select id="filter-type" class="form-control" onchange="renderEmsTable()">
+                <option value="stores">Stores</option>
+                <option value="missing">Nonexistent Stores</option>
+                <option value="racks">Racks</option>
+                <option value="circuits">Circuits</option>
+            </select>
+            <button class="secondary-button" onclick="exportSqliteData()">📥 Export SQLite DB</button>
+            <button class="secondary-button" onclick="document.getElementById('import-file').click()">📤 Import SQLite DB</button>
+            <input type="file" id="import-file" style="display: none" accept=".sqlite,.db,.sqlite3" onchange="importSqliteData(event)" />
+            <button class="danger-button" onclick="clearData()">🗑️ Clear Database</button>
+        </div>
+        <div class="table-container" style="overflow-x: auto; max-height: 500px; overflow-y: auto;">
+            <table class="ems-table" id="ems-table">
+                <thead>
+                    <tr id="table-headers">
+                        <!-- Dynamic headers -->
+                    </tr>
+                </thead>
+                <tbody id="table-body">
+                    <!-- Dynamic rows -->
+                </tbody>
+            </table>
+        </div>
+    </div>
+    
+    <!-- Review Tab (For Flagged Items) -->
+    <div id="reviewTab" class="tab-content">
+        <p>The following stores were flagged because they have an EMS type of "OPUS" (needs manual confirmation as Opus Architect or Opus Magnum) or an unknown/unsupported EMS type.</p>
+        <div class="table-container" style="overflow-x: auto; max-height: 500px; overflow-y: auto;">
+            <table class="ems-table" id="review-table">
+                <thead>
+                    <tr>
+                        <th>Store #</th>
+                        <th>Rack Name</th>
+                        <th>Network Address</th>
+                        <th>Flagged Type</th>
+                        <th>Resolve As</th>
+                        <th>Action</th>
+                    </tr>
+                </thead>
+                <tbody id="review-body">
+                    <!-- Dynamic rows -->
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Dashboard Tab -->
+    <div id="statsTab" class="tab-content">
+        <div class="ems-controls" style="justify-content: flex-end;">
+            <button class="primary-button" onclick="renderCharts()">🔄 Refresh Charts</button>
+        </div>
+        <div class="dashboard-grid">
+            <div class="chart-card">
+                <h3>EMS Types</h3>
+                <canvas id="chartEmsTypes"></canvas>
+            </div>
+            <div class="chart-card">
+                <h3>Stores vs Nonexistent</h3>
+                <canvas id="chartStoreStatus"></canvas>
+            </div>
+            <div class="chart-card">
+                <h3>Top 10 Stores by Racks</h3>
+                <canvas id="chartTopRacks"></canvas>
+            </div>
+            <div class="chart-card">
+                <h3>Top 10 Stores by Circuits</h3>
+                <canvas id="chartTopCircuits"></canvas>
+            </div>
+            <div class="chart-card">
+                <h3>Rack Temperature Types</h3>
+                <canvas id="chartTempTypes"></canvas>
+            </div>
+            <div class="chart-card" style="grid-column: 1 / -1;">
+                <h3>Scanned Over Time</h3>
+                <canvas id="chartTimeSeries" height="100"></canvas>
             </div>
         </div>
-
-        <div class="form-group" style="margin-top:15px;">
-            <label for="modalRacks">Racks to Save (comma separated):</label>
-            <input type="text" id="modalRacks" class="form-control" placeholder="e.g. LTA, MTB, DTC">
-        </div>
-
-
-        <button class="primary-button" onclick="saveEmsEntry()">Save Mappings</button>
     </div>
 </div>
 
 <script>
-// State
-let frostbyteEmsMapping = JSON.parse(localStorage.getItem('emsMappingData')) || {};
-
-// Save to storage
-function saveToStorage() {
-    localStorage.setItem('emsMappingData', JSON.stringify(frostbyteEmsMapping));
+// Tab Switching
+function switchTab(evt, tabName) {
+    let i, tabcontent, tablinks;
+    tabcontent = document.getElementsByClassName("tab-content");
+    for (i = 0; i < tabcontent.length; i++) {
+        tabcontent[i].className = tabcontent[i].className.replace(" active", "");
+    }
+    tablinks = document.getElementsByClassName("tab");
+    for (i = 0; i < tablinks.length; i++) {
+        tablinks[i].className = tablinks[i].className.replace(" active", "");
+    }
+    document.getElementById(tabName).className += " active";
+    evt.currentTarget.className += " active";
+    
+    if (tabName === 'dataTab') renderEmsTable();
+    if (tabName === 'reviewTab') renderReviewTable();
+    if (tabName === 'statsTab') renderCharts();
 }
 
-// Render Table - Simplified for Store and Rack only
-function renderEmsTable() {
-    const tbody = document.querySelector("#ems-table tbody");
-    if (!tbody) return;
+// Database Management
+let db;
+let SQL;
+let isScanning = false;
+let stopRequested = false;
 
-    const searchTerm = document.getElementById("ems-search").value.trim().toLowerCase();
-    let html = "";
+// Token mapping from previous API request analysis
+const API_TOKEN = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lX2lkIjoidm41ODBmYyIsImZpcnN0X25hbWUiOiJBbmRyZXciLCJsYXN0X25hbWUiOiJUb290aG1hbiIsInVzZXJfSUQiOiJ2bjU4MGZjIiwiZnVsbF9uYW1lIjoiQW5kcmV3IFRvb3RobWFuIC0gdm41ODBmYyIsImFkR3JvdXBzIjpbIldFSW9UIFVTIEJ1aWxkaW5nIFBlcmZvcm1hbmNlIE1hbmFnZXJzIiwiV0VJb1QgVVMgRGlnaXRhbCBBc3NldHMiLCJXRUlvVCBVUyBJbnNvdXJjZSJdLCJyZWxheVN0YXRlIjoic2Vuc29ycyIsImlhdCI6MTc4MzU5OTI0M30.8so7HSFI_ZknK25xWrCAhqOhkfrPx80x0IGRr9puVeA';
+const API_URL = 'https://weiot-em-telemetryapi.prod.walmart.com/api/sensors/getsensorhierarchy';
 
-    for (const storeId in frostbyteEmsMapping) {
-        if (searchTerm && !storeId.includes(searchTerm)) continue;
+const SUPPORTED_EMS_TYPES = [
+    'Danfoss AKA65', 'Danfoss Storeview',
+    'Carel', 'Novar', 'Emerson', 'CPC Ultrasite',
+    'Copeland', 'Connect+', 'Opus Architect', 'Opus Magnum'
+];
 
-        const storeData = frostbyteEmsMapping[storeId];
-        if (!storeData.racks) continue;
+// ----- Shared SQLite file (File System Access API; Chrome/Edge only) -----
+// Keep this block identical in Frostbyte.html and EMS_Mapper_Tool.html.
+const SharedDb = (() => {
+    const IDB_NAME = 'FrostbyteSharedDb';
+    const IDB_STORE = 'handles';
+    const IDB_KEY = 'sharedFile';
+    const SQL_BASE = 'https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.8.0/';
+    const PICKER_TYPES = [{ description: 'SQLite database', accept: { 'application/x-sqlite3': ['.sqlite', '.sqlite3', '.db'] } }];
+    const BATCH_LIMIT = 25;
+    const BATCH_DELAY_MS = 1500;
 
-        for (const rackName in storeData.racks) {
-            html += `<tr>
-                <td>${storeId}</td>
-                <td>${frostbyteEmsMapping[storeId].racks[rackName]?.ems || 'Unknown'}</td>
-                <td>${rackName}</td>
-                <td>
-                    <button class="danger-button action-button" onclick="deleteEmsEntry('${storeId}', '${rackName}')" style="margin: 0; padding: 4px 8px;">Delete Rack</button>
-                </td>
-            </tr>`;
+    let handle = null;
+    let ready = false;
+    let lastModified = 0;
+    let sqlPromise = null;
+    let queue = [];
+    let chain = Promise.resolve();
+    let active = 0;
+    let timer = null;
+    let onError = () => {};
+
+    function openIdb() {
+        return new Promise((resolve, reject) => {
+            const req = indexedDB.open(IDB_NAME, 1);
+            req.onupgradeneeded = () => req.result.createObjectStore(IDB_STORE);
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error);
+        });
+    }
+
+    async function idbRun(mode, op) {
+        const idb = await openIdb();
+        return new Promise((resolve, reject) => {
+            const req = op(idb.transaction(IDB_STORE, mode).objectStore(IDB_STORE));
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error);
+        });
+    }
+
+    function getSQL() {
+        if (!sqlPromise) {
+            sqlPromise = (async () => {
+                while (typeof initSqlJs === 'undefined') await new Promise(r => setTimeout(r, 100));
+                return initSqlJs({ locateFile: f => SQL_BASE + f });
+            })();
+        }
+        return sqlPromise;
+    }
+
+    async function ensurePermission(prompt) {
+        if (!handle) return false;
+        const opts = { mode: 'readwrite' };
+        let p = await handle.queryPermission(opts);
+        if (p !== 'granted' && prompt) p = await handle.requestPermission(opts);
+        ready = p === 'granted';
+        return ready;
+    }
+
+    async function restore() {
+        if (!window.showOpenFilePicker) return 'unsupported';
+        try { handle = (await idbRun('readonly', s => s.get(IDB_KEY))) || null; } catch (e) { handle = null; }
+        if (!handle) return 'none';
+        return (await ensurePermission(false)) ? 'ready' : 'needs-permission';
+    }
+
+    async function link() {
+        const [h] = await window.showOpenFilePicker({ types: PICKER_TYPES, multiple: false });
+        handle = h;
+        await idbRun('readwrite', s => s.put(h, IDB_KEY));
+        return ensurePermission(true);
+    }
+
+    async function create(bytes) {
+        const h = await window.showSaveFilePicker({ suggestedName: 'EMS_Scanner_DB.sqlite', types: PICKER_TYPES });
+        handle = h;
+        await idbRun('readwrite', s => s.put(h, IDB_KEY));
+        if (!(await ensurePermission(true))) return false;
+        await writeBytes(bytes);
+        return true;
+    }
+
+    async function unlink() {
+        handle = null;
+        ready = false;
+        queue = [];
+        await idbRun('readwrite', s => s.delete(IDB_KEY));
+    }
+
+    async function readBytes() {
+        const file = await handle.getFile();
+        lastModified = file.lastModified;
+        return new Uint8Array(await file.arrayBuffer());
+    }
+
+    async function writeBytes(bytes) {
+        const w = await handle.createWritable();
+        await w.write(bytes);
+        await w.close();
+        lastModified = (await handle.getFile()).lastModified;
+    }
+
+    async function hasChanged() {
+        return (await handle.getFile()).lastModified !== lastModified;
+    }
+
+    // Serializes writers across tabs; falls back to no lock where Web Locks is blocked (file://).
+    async function withLock(fn) {
+        if (navigator.locks) {
+            try { return await navigator.locks.request('frostbyte-shared-db', fn); }
+            catch (e) { if (e.name !== 'SecurityError') throw e; }
+        }
+        return fn();
+    }
+
+    async function runFlush() {
+        if (!queue.length) return null;
+        const batch = queue;
+        queue = [];
+        active++;
+        try {
+            return await withLock(async () => {
+                const SQL = await getSQL();
+                const db = new SQL.Database(await readBytes());
+                try {
+                    batch.forEach(fn => fn(db));
+                    const bytes = db.export();
+                    await writeBytes(bytes);
+                    return bytes;
+                } finally {
+                    db.close();
+                }
+            });
+        } catch (e) {
+            queue = batch.concat(queue);
+            if (e && e.name === 'NotAllowedError') ready = false;
+            throw e;
+        } finally {
+            active--;
         }
     }
 
-    if (html === "") {
-        html = `<tr><td colspan="3" style="text-align: center; color: #888; padding: 20px;">No racks mapped. Add one to get started.</td></tr>`;
+    function flush() {
+        clearTimeout(timer);
+        timer = null;
+        const p = chain.catch(() => {}).then(runFlush);
+        chain = p;
+        return p;
     }
 
-    tbody.innerHTML = html;
-}
-
-// Modal functions
-function openEmsModal() {
-    document.getElementById('modalStoreId').value = '';
-    document.getElementById('modalEmsType').value = '';
-    document.getElementById('modalRacks').value = '';
-    clearRackBuilder();
-    document.getElementById('emsModal').style.display = 'block';
-}
-
-function closeEmsModal() {
-    document.getElementById('emsModal').style.display = 'none';
-}
-
-// Save an entry
-function saveEmsEntry() {
-    const storeId = document.getElementById('modalStoreId').value.trim();
-    const emsType = document.getElementById('modalEmsType').value;
-    const racksInput = document.getElementById('modalRacks').value.trim();
-
-    if (!storeId || !emsType || !racksInput) {
-        alert("Please provide the Store Number, EMS System, and at least one Rack.");
-        return;
+    // Each fn runs against a freshly re-read copy of the file, so edits from the other page are preserved.
+    function enqueue(fn) {
+        queue.push(fn);
+        if (queue.length >= BATCH_LIMIT) {
+            flush().catch(onError);
+        } else if (!timer) {
+            timer = setTimeout(() => flush().catch(onError), BATCH_DELAY_MS);
+        }
     }
 
-    // Split and clean up racks
-    const racksList = racksInput.split(',').map(r => r.trim()).filter(r => r);
-
-    // Initialize store if it doesn't exist
-    if (!frostbyteEmsMapping[storeId]) {
-        frostbyteEmsMapping[storeId] = { racks: {} };
-    }
-    
-    if (!frostbyteEmsMapping[storeId].racks) {
-        frostbyteEmsMapping[storeId].racks = {};
+    // Returns the resulting file bytes even when another batch already applied this fn.
+    async function mutate(fn) {
+        queue.push(fn);
+        return (await flush()) || readBytes();
     }
 
-    // Set rack info
-    racksList.forEach(rackName => {
-        frostbyteEmsMapping[storeId].racks[rackName] = { 
-            circuits: {},
-            ems: emsType
-        };
+    return {
+        getSQL, restore, link, create, unlink, readBytes, writeBytes, hasChanged, enqueue, flush, mutate,
+        reconnect: () => ensurePermission(true),
+        isSupported: () => !!window.showOpenFilePicker,
+        isLinked: () => !!handle,
+        isReady: () => !!handle && ready,
+        hasPending: () => queue.length > 0 || active > 0,
+        fileName: () => (handle ? handle.name : ''),
+        setErrorHandler: (fn) => { onError = fn; }
+    };
+})();
+
+async function initDB() {
+    logMsg('Initializing SQLite WASM...', 'info');
+    SQL = await SharedDb.getSQL();
+    SharedDb.setErrorHandler(err => {
+        logMsg(`Shared database write failed: ${err.message}`, 'error');
+        updateSharedUi();
     });
 
-    saveToStorage();
-    renderEmsTable();
-    closeEmsModal();
+    const sharedState = await SharedDb.restore();
+    if (sharedState === 'ready') {
+        try {
+            await loadFromShared();
+            logMsg(`Loaded database from shared file ${SharedDb.fileName()}.`, 'info');
+        } catch (err) {
+            logMsg(`Could not read shared file: ${err.message}`, 'error');
+        }
+    }
+
+    if (!db) {
+        // Check IndexedDB backup first
+        const savedData = await loadFromIndexedDB();
+        if (savedData) {
+            logMsg('Loaded existing database from IndexedDB.', 'info');
+            db = new SQL.Database(savedData);
+            // Patch DB to include host_address if it doesn't exist
+            try {
+                db.run("ALTER TABLE Racks ADD COLUMN host_address TEXT");
+            } catch(err) { /* column exists */ }
+        } else {
+            logMsg('Creating new database...', 'info');
+            db = new SQL.Database();
+            createSchema();
+        }
+    }
+
+    if (sharedState === 'needs-permission') {
+        logMsg('Shared database file is linked but access must be re-granted. Click Reconnect.', 'warn');
+    }
+
+    updateSharedUi();
+    updateReviewCount();
+    loadSchedule();
+    setInterval(checkSchedule, 60000);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) syncFromShared(); });
+    window.addEventListener('focus', syncFromShared);
+    checkSchedule();
 }
 
-// Delete entry
-function deleteEmsEntry(storeId, rackName) {
-    if (confirm(`Are you sure you want to delete Rack ${rackName} from Store ${storeId}?`)) {
-        if (frostbyteEmsMapping[storeId] && frostbyteEmsMapping[storeId].racks) {
-            delete frostbyteEmsMapping[storeId].racks[rackName];
-            
-            // Clean up store if empty
-            if (Object.keys(frostbyteEmsMapping[storeId].racks).length === 0) {
-                delete frostbyteEmsMapping[storeId];
-            }
-            
-            saveToStorage();
-            renderEmsTable();
+// Applies a change to the in-memory db, the IndexedDB cache and (if linked) the shared file.
+function commit(fn) {
+    fn(db);
+    saveToIndexedDB();
+    if (SharedDb.isReady()) SharedDb.enqueue(fn);
+}
+
+function refreshViews() {
+    updateReviewCount();
+    renderEmsTable();
+    renderReviewTable();
+    const stats = document.getElementById('statsTab');
+    if (stats && stats.classList.contains('active')) renderCharts();
+}
+
+async function loadFromShared() {
+    const bytes = await SharedDb.readBytes();
+    if (bytes.length === 0) {
+        // A brand new empty file is seeded from the current database.
+        if (db) await SharedDb.writeBytes(db.export());
+        return;
+    }
+    if (db) db.close();
+    db = new SQL.Database(bytes);
+    try {
+        db.run("ALTER TABLE Racks ADD COLUMN host_address TEXT");
+    } catch(err) { /* column exists */ }
+    saveToIndexedDB();
+    refreshViews();
+}
+
+async function syncFromShared() {
+    if (!SharedDb.isReady() || isScanning || SharedDb.hasPending()) return;
+    try {
+        if (await SharedDb.hasChanged()) {
+            await loadFromShared();
+            logMsg('Reloaded shared database (changed by another page).', 'info');
         }
+    } catch (err) {
+        logMsg(`Shared database check failed: ${err.message}`, 'warn');
     }
 }
 
-// Export data - Simplified for Store and Rack ONLY
-function exportEmsData() {
-    if (Object.keys(frostbyteEmsMapping).length === 0) {
-        alert("No data to export");
+function updateSharedUi() {
+    const status = document.getElementById('shared-db-status');
+    if (!status) return;
+    const show = (id, visible) => { document.getElementById(id).style.display = visible ? 'inline-block' : 'none'; };
+
+    if (!SharedDb.isSupported()) {
+        status.textContent = 'This browser does not support shared files (use Chrome or Edge). Using browser storage only.';
+        show('shared-link-btn', false); show('shared-create-btn', false); show('shared-reconnect-btn', false); show('shared-unlink-btn', false);
+        return;
+    }
+    if (SharedDb.isReady()) status.textContent = `Linked: ${SharedDb.fileName()} (read/write)`;
+    else if (SharedDb.isLinked()) status.textContent = `Linked: ${SharedDb.fileName()} - access must be re-granted.`;
+    else status.textContent = 'Not linked. Using browser storage only.';
+
+    show('shared-link-btn', !SharedDb.isLinked());
+    show('shared-create-btn', !SharedDb.isLinked());
+    show('shared-reconnect-btn', SharedDb.isLinked() && !SharedDb.isReady());
+    show('shared-unlink-btn', SharedDb.isLinked());
+}
+
+async function sharedDbLink() {
+    try {
+        if (!(await SharedDb.link())) {
+            logMsg('Access to the shared file was not granted.', 'warn');
+        } else {
+            await loadFromShared();
+            logMsg(`Linked shared database ${SharedDb.fileName()}.`, 'info');
+        }
+    } catch (err) {
+        if (err.name !== 'AbortError') logMsg(`Linking failed: ${err.message}`, 'error');
+    }
+    updateSharedUi();
+}
+
+async function sharedDbCreate() {
+    try {
+        if (await SharedDb.create(db.export())) {
+            logMsg(`Created shared database ${SharedDb.fileName()} from the current data.`, 'info');
+        }
+    } catch (err) {
+        if (err.name !== 'AbortError') logMsg(`Creating file failed: ${err.message}`, 'error');
+    }
+    updateSharedUi();
+}
+
+async function sharedDbReconnect() {
+    try {
+        if (await SharedDb.reconnect()) {
+            await SharedDb.flush();
+            await loadFromShared();
+            logMsg('Shared database reconnected.', 'info');
+        }
+    } catch (err) {
+        logMsg(`Reconnect failed: ${err.message}`, 'error');
+    }
+    updateSharedUi();
+}
+
+async function sharedDbUnlink() {
+    await SharedDb.unlink();
+    logMsg('Shared database unlinked. Using browser storage only.', 'info');
+    updateSharedUi();
+}
+
+function createSchema() {
+    db.run(`
+        CREATE TABLE IF NOT EXISTS Stores (
+            store_id INTEGER PRIMARY KEY,
+            last_scanned DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS MissingStores (
+            store_id INTEGER PRIMARY KEY,
+            last_checked DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS Racks (
+            rack_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            store_id INTEGER,
+            rack_name TEXT,
+            ems_type TEXT,
+            needs_review BOOLEAN DEFAULT 0,
+            host_address TEXT,
+            FOREIGN KEY(store_id) REFERENCES Stores(store_id),
+            UNIQUE(store_id, rack_name)
+        );
+        CREATE TABLE IF NOT EXISTS Circuits (
+            circuit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rack_id INTEGER,
+            circuit_name TEXT,
+            FOREIGN KEY(rack_id) REFERENCES Racks(rack_id)
+        );
+    `);
+    saveToIndexedDB();
+}
+
+// ----- IndexedDB Operations -----
+const IDB_NAME = 'EmsMapperDB';
+const STORE_NAME = 'sqliteBackup';
+const DB_KEY = 'mainDB';
+
+function openIndexedDB() {
+    return new Promise((resolve, reject) => {
+        const req = indexedDB.open(IDB_NAME, 1);
+        req.onupgradeneeded = (e) => {
+            e.target.result.createObjectStore(STORE_NAME);
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+    });
+}
+
+async function loadFromIndexedDB() {
+    const idb = await openIndexedDB();
+    return new Promise((resolve, reject) => {
+        const tx = idb.transaction(STORE_NAME, 'readonly');
+        const store = tx.objectStore(STORE_NAME);
+        const req = store.get(DB_KEY);
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+    });
+}
+
+let saveTimeout;
+async function saveToIndexedDB() {
+    // Debounce saves
+    clearTimeout(saveTimeout);
+    saveTimeout = setTimeout(async () => {
+        if (!db) return;
+        const idb = await openIndexedDB();
+        const data = db.export();
+        return new Promise((resolve, reject) => {
+            const tx = idb.transaction(STORE_NAME, 'readwrite');
+            const store = tx.objectStore(STORE_NAME);
+            const req = store.put(data, DB_KEY);
+            req.onsuccess = () => resolve();
+            req.onerror = () => reject(req.error);
+        });
+    }, 1000);
+}
+
+// ----- Logging & UI Utilities -----
+function logMsg(msg, type='log') {
+    const lg = document.getElementById('scan-log');
+    lg.style.display = 'block';
+    
+    const div = document.createElement('div');
+    const time = new Date().toLocaleTimeString();
+    div.innerHTML = `[${time}] ${msg}`;
+    
+    if (type === 'error') div.className = 'log-error';
+    if (type === 'warn') div.className = 'log-warn';
+    if (type === 'info') div.className = 'log-info';
+    
+    lg.appendChild(div);
+    lg.scrollTop = lg.scrollHeight;
+}
+
+function updateReviewCount() {
+    if (!db) return;
+    const res = db.exec("SELECT COUNT(*) FROM Racks WHERE needs_review = 1");
+    if (res.length > 0 && res[0].values[0][0] > 0) {
+        const count = res[0].values[0][0];
+        const tab = document.getElementById('reviewCountTab');
+        tab.style.display = 'inline-block';
+        tab.innerText = `Needs Review (${count})`;
+        tab.style.color = '#ff9800';
+    } else {
+        document.getElementById('reviewCountTab').style.display = 'none';
+    }
+}
+
+// ----- Scanner Engine -----
+
+async function startScan(presetList) {
+    if (!db) {
+        alert("SQL.js is not loaded yet. Please wait a moment.");
+        return;
+    }
+    
+    const startStore = parseInt(document.getElementById('start-store').value) || 1;
+    const endStore = parseInt(document.getElementById('end-store').value) || 9999;
+    const rescanMissing = document.getElementById('rescan-missing').checked;
+    
+    if (!presetList && startStore > endStore) {
+        alert("Start store must be less than or equal to end store.");
         return;
     }
 
-    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(frostbyteEmsMapping, null, 2));
-    const downloadAnchorNode = document.createElement("a");
-    downloadAnchorNode.setAttribute("href", dataStr);
-    downloadAnchorNode.setAttribute("download", `frostbyte_ems_mapping_${new Date().toISOString().split('T')[0]}.json`);
-    document.body.appendChild(downloadAnchorNode);
-    downloadAnchorNode.click();
-    downloadAnchorNode.remove();
-}
-
-// Clear all data
-function clearEmsData() {
-    if (confirm("Are you sure you want to clear all EMS Mapping data? This cannot be undone.")) {
-        frostbyteEmsMapping = {};
-        saveToStorage();
-        renderEmsTable();
+    const blocker = scanBlocker();
+    if (blocker) {
+        logMsg(`Cannot scan: ${blocker}`, "error");
+        return;
     }
-}
 
-// Close modal if clicked outside
-window.onclick = function(event) {
-    const modal = document.getElementById('emsModal');
-    if (event.target == modal) {
-        closeEmsModal();
+    // Pick up edits made in Frostbyte (e.g. Opus classifications) before scanning.
+    await syncFromShared();
+
+    isScanning = true;
+    stopRequested = false;
+    
+    document.getElementById('start-scan-btn').style.display = 'none';
+    document.getElementById('stop-scan-btn').style.display = 'inline-block';
+    
+    const pContainer = document.getElementById('progress-wrapper');
+    const pBar = document.getElementById('scan-progress');
+    pContainer.style.display = 'block';
+    pBar.style.width = '0%';
+    pBar.innerText = '0%';
+
+    const statusEl = document.getElementById('current-scan-status');
+    
+    let toScan = presetList ? presetList.slice() : [];
+    
+    // Gather list
+    for (let i = startStore; !presetList && i <= endStore; i++) {
+        // Skip missing unless overriding
+        if (!rescanMissing) {
+            const isMissing = db.exec(`SELECT 1 FROM MissingStores WHERE store_id = ${i}`);
+            if (isMissing.length > 0) continue;
+        }
+        toScan.push(i);
     }
-}
+    
+    logMsg(`Queue populated with ${toScan.length} stores.`, 'info');
+    
+    const total = toScan.length;
+    let completed = 0;
 
-// Initial render
-
-// Rack Name Builder State
-let builderState = { prefix: "", type: "", letters: [] };
-
-function initRackBuilder() {
-    const createMultiGroup = (items, key, multi = false, containerId) => {
-        const container = document.getElementById(containerId);
-        container.innerHTML = '';
+    for (const storeId of toScan) {
+        if (stopRequested) {
+            logMsg("Scan stopped internally by user.", "warn");
+            break;
+        }
         
-        items.forEach((item) => {
-            const btn = document.createElement("button");
-            btn.type = "button";
-            btn.className = "secondary-button";
-            btn.style.padding = "5px 10px";
-            btn.style.minWidth = "40px";
-            btn.textContent = item;
-            
-            btn.onclick = () => {
-                if (multi) {
-                    const idx = builderState[key].indexOf(item);
-                    if (idx > -1) {
-                        builderState[key].splice(idx, 1);
-                        btn.style.backgroundColor = "";
-                        btn.style.color = "";
-                    } else {
-                        builderState[key].push(item);
-                        builderState[key].sort();
-                        btn.style.backgroundColor = "#007acc";
-                        btn.style.color = "white";
+        statusEl.innerText = `Scanning Store ${storeId}...`;
+
+        await scanStore(storeId);
+        
+        // Progress update
+        completed++;
+        const pct = Math.round((completed / total) * 100);
+        pBar.style.width = pct + '%';
+        pBar.innerText = pct + '%';
+        
+        // Brief sleep to yield thread to UI and database saves, and aviod api rate limit
+        await new Promise(r => setTimeout(r, 200)); 
+    }
+    
+    isScanning = false;
+    statusEl.innerText = stopRequested ? "Scan aborted." : "Scan Complete!";
+    document.getElementById('start-scan-btn').style.display = 'inline-block';
+    document.getElementById('stop-scan-btn').style.display = 'none';
+
+    try {
+        await SharedDb.flush();
+        // Reload so classifications made in Frostbyte during the scan show up.
+        if (SharedDb.isReady() && !SharedDb.hasPending()) await loadFromShared();
+    } catch (err) {
+        logMsg(`Shared database write failed: ${err.message}`, 'error');
+        updateSharedUi();
+    }
+    
+    updateReviewCount();
+}
+
+function stopScan() {
+    if(isScanning) {
+        stopRequested = true;
+        logMsg("Stop requested...", "warn");
+    }
+}
+
+// ----- Parsing API Logic -----
+
+async function scanStore(storeId) {
+    try {
+        const response = await window.GM_fetch(API_URL, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': API_TOKEN,
+                'x-tenant': 'US',
+                'lang': 'en',
+                'origin': 'https://em.walmart.com'
+            },
+            body: JSON.stringify({"cc": "US", "storeNo": storeId, "rackIndex": null, "sensorIOType": null})
+        });
+
+        if (!response.ok) {
+            if (response.status === 404 || response.status === 400 || response.status === 500) {
+                // Assuming an error like 404 means nonexistent
+                logMsg(`Store ${storeId} got HTTP ${response.status}. Marking as nonexistent.`, 'warn');
+                markStoreMissing(storeId);
+            } else {
+                throw new Error(`HTTP Error ${response.status}: ${response.statusText}`);
+            }
+            return;
+        }
+
+        const textResponse = await response.text();
+        if (!textResponse || textResponse.trim() === '' || textResponse === 'undefined') {
+            logMsg(`Store ${storeId} returned empty response. Marking as nonexistent.`, 'warn');
+            markStoreMissing(storeId);
+            return;
+        }
+        
+        const data = JSON.parse(textResponse);
+        
+        // If API returns an empty shell or something indicating it doesnt exist though 200 OK
+        if(!data || typeof data.value === 'undefined') {
+            logMsg(`Store ${storeId} returned ok, but data has no 'value'. Marking as nonexistent.`, 'warn');
+            markStoreMissing(storeId);
+            return;
+        }
+        
+        // It's a valid store
+        saveStoreData(storeId, data);
+        
+    } catch(err) {
+        logMsg(`Store ${storeId} Failed: ${err.message}`, 'error');
+    }
+}
+
+function markStoreMissing(storeId) {
+    commit(db => {
+        db.run("INSERT OR REPLACE INTO MissingStores (store_id) VALUES (?)", [storeId]);
+        db.run("DELETE FROM Stores WHERE store_id = ?", [storeId]);
+        db.run("DELETE FROM Circuits WHERE rack_id IN (SELECT rack_id FROM Racks WHERE store_id = ?)", [storeId]);
+        db.run("DELETE FROM Racks WHERE store_id = ?", [storeId]);
+    });
+    logMsg(`Store ${storeId} marked as Nonexistent.`);
+}
+
+function saveStoreData(storeId, data) {
+    let hasRacks = false;
+    commit(d => {
+        const result = applyStoreData(d, storeId, data);
+        if (d === db) hasRacks = result;
+    });
+    if (hasRacks) {
+        logMsg(`Saved Store ${storeId} data successfully.`);
+    }
+}
+
+// Runs against whichever db it is given (in-memory copy or a fresh copy of the shared file).
+function applyStoreData(db, storeId, data) {
+    db.run("INSERT OR REPLACE INTO Stores (store_id) VALUES (?)", [storeId]);
+    db.run("DELETE FROM MissingStores WHERE store_id = ?", [storeId]); // Clear if it was resurrected
+    
+    if(!data.children) return;
+
+    db.run("BEGIN TRANSACTION");
+    let hasRacks = false;
+    
+    // Fetch historical rack states for this store BEFORE wiping them out.
+    // If the user manually set a rack to "Opus Architect" previously, we want to retain that identity.
+    const historyRes = db.exec("SELECT rack_name, ems_type, needs_review FROM Racks WHERE store_id = ?", [storeId]);
+    const historicalRacks = {};
+    if (historyRes.length > 0) {
+        historyRes[0].values.forEach(row => {
+            historicalRacks[row[0].toUpperCase()] = { type: row[1], review: row[2] };
+        });
+    }
+
+    // Clear out old racks and circuits for this store so that modifications/deletions 
+    // on the API side are correctly reflected locally.
+    db.run("DELETE FROM Circuits WHERE rack_id IN (SELECT rack_id FROM Racks WHERE store_id = ?)", [storeId]);
+    db.run("DELETE FROM Racks WHERE store_id = ?", [storeId]);
+
+    const rackValueToDbId = {};
+    const circuitsToInsert = [];
+    
+
+    for (const child of data.children) {
+        // child.label usually looks like "HVAC (OPUS)" or "LTA (OPUS)"
+        let labelStr = child.label || '';
+        labelStr = labelStr.replace(/\s*\(\s*COMM LOSS\s*\)/ig, ''); // Remove (COMM LOSS)
+        
+        // Skip purely generic/non-rack groupings if they don't have circuit children, though usually these are all racks.
+        // Cases node check (from your snippet, label: "Cases" has value 0). 
+        if (labelStr.toUpperCase() === 'CASES') {
+            if (child.children) {
+                for (const circuit of child.children) {
+                    const parts = (circuit.key || "").split('|');
+                    const rackVal = parts.length > 3 ? parseInt(parts[3], 10) : null;
+                    
+                    let cName = circuit.circuitName || circuit.modLabelForGrouping || circuit.label || "Unknown";
+                    
+                    // Specific circuit name filtering/cleaning based on expected formats
+                    let cleanCName = cName.trim();
+                    // Some cases come back with "CIM40" as the modLabelForGrouping, we want to extract actual circuitName if it exists
+                    if (circuit.circuitName && circuit.circuitName.trim() !== '') {
+                        cleanCName = circuit.circuitName.trim();
                     }
+                    
+                    // Regex for matching target cases like A3, AS7, RCU1, LT-SC, RE1, AHU1 etc.
+                    const circuitRegex = /^([A-Z]{1,2}S?\d+(\.\d+)?|RCU\d+|[A-Z]{2}-SC.*|RE\d+|RG\d+|RC\d+|AHU\d+|AHMCU.*)$/i;
+                    
+                    let fullName = cleanCName;
+                    
+                    let category = circuit.category ? circuit.category.toLowerCase() : "";
+                    
+                    // Exclude any node not tagged under a valid circuit-related category
+                    if (category && !['case', 'circuit', 'hvac'].includes(category)) {
+                        continue;
+                    }
+                    
+                    // Exclude generic board modules
+                    // Uses 'match' to catch tokens anywhere in the string, except IOM exceptions.
+                    if (/(XIO|ROM|RIM|CCM|COM|CIM|EIM|XCM20R|minIO|NCH|SQD)/i.test(fullName) || 
+                        (/IOM/i.test(fullName) && !/-(AHU|AHMCU)/i.test(fullName)) ||
+                        /PHASE LOSS|VFD/i.test(fullName)) {
+                        continue; 
+                    }
+                    
+                    // Strip remaining "(COMM LOSS)" that may exist on the circuit names
+                    fullName = fullName.replace(/\s*\(\s*COMM LOSS\s*\)/ig, '').trim();
+                    
+                    // If it matches our expected circuit pattern perfectly, we can avoid appending the noisy caseType stuff unless we want it,
+                    // but since we want to deduplicate by the base circuit, we will use the cleanCName as the core identifier.
+                    let cType = circuit.caseType || "";
+                    let cContents = circuit.caseContents || "";
+                    
+                    // We only want the base circuit name (A9, etc) without the extra details
+                    // so we do not append the caseType or caseContents to the fullName anymore.
+                    
+                    // Cleanup trailing slashes explicitly (like A05/ -> A05) and split combinations (A5/A6) capturing the first one
+                    fullName = fullName.split('/')[0].trim();
+                    cleanCName = cleanCName.split('/')[0].trim();
+                    
+                    circuitsToInsert.push({
+                        rack_val: rackVal,
+                        hash: `${rackVal}-${cleanCName.toUpperCase()}`, // DEDUPLICATE ONLY BY THE CLEAN BASE CIRCUIT NAME
+                        circuit_name: fullName // Display name can still have the (bakery, freezer) etc attached
+                    });
+                }
+            }
+            continue; // Ignore generic "Cases" grouping
+        }
+        
+        // Attempt to parse Rack Name and EMS Type. Ex: "LTA (OPUS)" -> Name: "LTA", Type: "OPUS"
+        let rawRackName = labelStr;
+        let rawEmsType = "Unknown";
+        
+        const match = labelStr.match(/^(.*?)\s*\((.*?)\)$/);
+        if (match) {
+            rawRackName = match[1].trim();
+            rawEmsType = match[2].trim();
+        }
+
+        // Infer EMS Type logic
+        let processedEmsType = rawEmsType;
+        let needsReview = 0;
+        
+        // Inherit manual selections from historical scans to protect user overrides
+        const historicalMatch = historicalRacks[rawRackName.toUpperCase()];
+        if (historicalMatch && historicalMatch.review === 0) {
+            // User previously verified this and assigned a permanent type
+            processedEmsType = historicalMatch.type;
+            needsReview = 0;
+        } else {
+            if (processedEmsType.toUpperCase() === 'OPUS') {
+                needsReview = 1; // Default to needing manual confirmation
+                
+                // Deterministic check for Architect vs Magnum
+                if (child.children) {
+                    let hasXcm20r = false;
+                    
+                    for (const c of child.children) {
+                        const modStr = c.modLabelForGrouping || "";
+                        if (modStr.includes("XCM20R")) hasXcm20r = true;
+                    }
+                    
+                    if (hasXcm20r) {
+                        // Based on field verification, the presence of an XCM20R board securely denotes Opus Architect.
+                        processedEmsType = "Opus Architect";
+                        needsReview = 0;
+                    }
+                    // Telemetry (BacnetNetwork vs Spectrum) overlaps unpredictably in the API, 
+                    // so without an XCM20R, it must fall back to "OPUS" and into the Needs Review tab automatically.
+                }
+            } else {
+                // Attempt to normalize known types
+                const upper = processedEmsType.toUpperCase();
+                if (upper.includes('NOVAR')) processedEmsType = 'Novar';
+                else if (upper.includes('DANFOSS') && (upper.includes('HVAC') || upper.includes('AIR'))) processedEmsType = 'Danfoss AKA65';
+                else if (upper.includes('DANFOSS')) processedEmsType = 'Danfoss Storeview';
+                else if (upper.includes('CAREL')) processedEmsType = 'Carel';
+                else if (upper.includes('ULTRASITE') || upper.includes('EMERSON')) processedEmsType = 'CPC Ultrasite';
+                else if (upper.includes('CONNECT') || upper.includes('COPELAND')) processedEmsType = 'Connect+';
+                else {
+                    needsReview = 1; // Unrecognized
+                }
+            }
+        }
+        
+        // Build Host Address correlating to the Rack value
+        let hostAddress = "";
+        if (child.value !== undefined && child.value !== null) {
+            const formattedStore = String(storeId).padStart(5, '0');
+            const formattedEms = String(child.value).padStart(2, '0');
+            hostAddress = `ems${formattedEms}.s${formattedStore}.us.wal-mart.com`;
+        }
+
+        // Insert Rack
+        db.run("INSERT OR REPLACE INTO Racks (store_id, rack_name, ems_type, needs_review, host_address) VALUES (?, ?, ?, ?, ?)", 
+            [storeId, rawRackName, processedEmsType, needsReview, hostAddress]);
+            
+        const rackRes = db.exec("SELECT last_insert_rowid()");
+        const rackId = rackRes[0].values[0][0];
+        
+        rackValueToDbId[child.value] = rackId;
+        hasRacks = true;
+        
+        // Insert circuits from rack nodes directly
+        if (child.children) {
+            for(const circuit of child.children) {
+                // For HVAC units and cases inside the Rack directly.
+                // We want to extract things like "RE1", "RG2", "RC3", "AHU1", "AHMCU" from the 'modLabelForGrouping' 
+                // e.g., "RE01 SNCKBAR K" -> "RE01"
+                let circuitName = circuit.circuitName || circuit.modLabelForGrouping || circuit.label || circuit.key || "Unknown Circuit";
+                
+                let category = circuit.category ? circuit.category.toLowerCase() : "";
+                
+                // Exclude any node not tagged under a valid circuit-related category
+                if (category && !['case', 'circuit', 'hvac'].includes(category)) {
+                    continue;
+                }
+                
+                let cleanCName = circuitName;
+                
+                // Exclude raw input/output expansion modules that aren't actual circuits
+                // Exception: allow IOM if it has AHMCU/AHU logic combined with it
+                if (/(XIO|ROM|RIM|CCM|COM|CIM|EIM|XCM20R|minIO|NCH|SQD)/i.test(circuitName) || 
+                    (/IOM/i.test(circuitName) && !/-(AHU|AHMCU)/i.test(circuitName)) ||
+                    /PHASE LOSS|VFD/i.test(circuitName)) {
+                    continue; // Completely skip logging these as valid circuits
+                }
+                
+                // Remove COMM LOSS from the remaining circuits
+                cleanCName = cleanCName.replace(/\s*\(\s*COMM LOSS\s*\)/ig, '').trim();
+
+                // If it is an HVAC module string like "RE01 SNCKBAR K", extract just the "RE01"
+                // Adding AHM\d+, clean duplicate tokens like AHM01 AHM01, and stop at slash parsing.
+                const moduleMatch = cleanCName.match(/^(RE\d+|RG\d+|RC\d+|AHU\d+|AHM\d+|AHMCU[^\s]*|(?:IOM\d?-)?AHMCU[^\s]*)/i);
+                if (moduleMatch) {
+                    cleanCName = moduleMatch[1].toUpperCase();
                 } else {
-                    if (builderState[key] === item) {
-                        builderState[key] = "";
-                        btn.style.backgroundColor = "";
-                        btn.style.color = "";
-                    } else {
-                        builderState[key] = item;
-                        Array.from(container.children).forEach((b) => {
-                            b.style.backgroundColor = "";
-                            b.style.color = "";
-                        });
-                        btn.style.backgroundColor = "#007acc";
-                        btn.style.color = "white";
+                    // Try to prefer circuitName if available instead of default grabbing raw labels
+                    if (circuit.circuitName && circuit.circuitName.trim() !== '') {
+                        cleanCName = circuit.circuitName.trim().toUpperCase();
                     }
                 }
-                updateManualInput();
-            };
-            container.appendChild(btn);
-        });
-    };
-
-    createMultiGroup(["HVAC", "HVACL", "AHM", "C", "R", "CKT", "CKTS"], "prefix", false, "prefix-btns");
-    createMultiGroup(["LT", "MT", "DT"], "type", false, "type-btns");
-    
-    // Custom Box
-    const customContainer = document.getElementById("letter-btns");
-    const alphabet = Array.from({ length: 26 }, (_, i) => String.fromCharCode(65 + i));
-    createMultiGroup(alphabet, "letters", true, "letter-btns");
-    
-    const customInput = document.createElement("input");
-    customInput.type = "text";
-    customInput.className = "form-control";
-    customInput.placeholder = "Custom Label";
-    customInput.style.width = "100px";
-    customInput.oninput = (e) => {
-        // Clear buttons if custom is used
-        builderState.letters = [e.target.value];
-        Array.from(document.getElementById("letter-btns").children).forEach((b) => {
-            if (b.tagName === 'BUTTON') {
-                b.style.backgroundColor = "";
-                b.style.color = "";
+                
+                // Cleanup trailing slashes explicitly (like A05/ -> A05) and split combinations (A5/A6) capturing the first one
+                cleanCName = cleanCName.split('/')[0].trim();
+                
+                circuitsToInsert.push({
+                    rack_val: child.value,
+                    hash: `${child.value}-${cleanCName}`,
+                    circuit_name: cleanCName
+                });
             }
-        });
-        updateManualInput();
-    };
-    customContainer.appendChild(customInput);
-}
-
-function updateManualInput() {
-    const rackInput = document.getElementById("builderResult");
-    let code = `${builderState.prefix}${builderState.type}${builderState.letters.join("")}`;
-    if (!builderState.prefix && !builderState.type && builderState.letters.length > 0) {
-        code = `Rack ${builderState.letters.join("")}`;
-    }
-    rackInput.value = code;
-}
-
-function clearRackBuilder() {
-    builderState = { prefix: "", type: "", letters: [] };
-    initRackBuilder(); // reset UI
-    document.getElementById("builderResult").value = '';
-}
-
-function addBuiltRack() {
-    const code = document.getElementById("builderResult").value.trim();
-    if (!code) return;
-    
-    const racksInput = document.getElementById('modalRacks');
-    if (racksInput.value) {
-        racksInput.value += `, ${code}`;
-    } else {
-        racksInput.value = code;
-    }
-    
-    clearRackBuilder();
-}
-
-document.addEventListener('DOMContentLoaded', () => {
-    initRackBuilder();
-    // Attempt to migrate from earlier naming convention if this is first run
-    const oldMappingStr = localStorage.getItem('frostbyteEmsMapping');
-    if (oldMappingStr && !localStorage.getItem('emsMappingData')) {
-        try {
-            frostbyteEmsMapping = JSON.parse(oldMappingStr);
-            saveToStorage();
-        } catch (e) {
-            console.error("Failed to parse old mappings");
         }
     }
     
-    renderEmsTable();
-});
+    // Deduplicate and map circuits to the correct rack ID
+    const seenCircuits = new Set();
+    for (const c of circuitsToInsert) {
+        if (!seenCircuits.has(c.hash)) {
+            seenCircuits.add(c.hash);
+            const rId = rackValueToDbId[c.rack_val];
+            if (rId) {
+                db.run("INSERT INTO Circuits (rack_id, circuit_name) VALUES (?, ?)", [rId, c.circuit_name]);
+            }
+        }
+    }
+    
+    db.run("COMMIT");
+    return hasRacks;
+}
+
+
+// ----- Reporting / Tables -----
+
+function renderEmsTable() {
+    if (!db) return;
+    
+    const filterType = document.getElementById('filter-type').value;
+    const searchTerm = document.getElementById('ems-search').value.trim();
+    const startStore = parseInt(document.getElementById('filter-start').value, 10);
+    const endStore = parseInt(document.getElementById('filter-end').value, 10);
+    
+    const headerRow = document.getElementById('table-headers');
+    const tbody = document.getElementById('table-body');
+    
+    // Helper string builder for WHERE conditions based on new bounds
+    function buildWhere(prefix) {
+        let conditions = [];
+        if (searchTerm) conditions.push(`${prefix}store_id LIKE '%${searchTerm}%'`);
+        if (!isNaN(startStore)) conditions.push(`${prefix}store_id >= ${startStore}`);
+        if (!isNaN(endStore)) conditions.push(`${prefix}store_id <= ${endStore}`);
+        return conditions.length > 0 ? ` WHERE ` + conditions.join(' AND ') : '';
+    }
+    
+    if (filterType === 'stores') {
+        headerRow.innerHTML = "<th>Store #</th><th>Total Racks</th><th>Total Circuits</th><th>Last Scanned</th>";
+        
+        let query = `
+            SELECT s.store_id, COUNT(DISTINCT r.rack_id), COUNT(c.circuit_id), s.last_scanned 
+            FROM Stores s
+            LEFT JOIN Racks r ON s.store_id = r.store_id
+            LEFT JOIN Circuits c ON r.rack_id = c.rack_id
+        `;
+        query += buildWhere('s.');
+        query += " GROUP BY s.store_id LIMIT 100";
+        
+        try {
+            const results = db.exec(query);
+            tbody.innerHTML = '';
+            
+            if (results.length === 0) {
+                tbody.innerHTML = "<tr><td colspan='4'>No stores scanned yet.</td></tr>";
+                return;
+            }
+            
+            results[0].values.forEach(row => {
+                const tr = document.createElement('tr');
+                tr.innerHTML = `<td>${row[0]}</td><td>${row[1]}</td><td>${row[2]}</td><td>${row[3]}</td>`;
+                tbody.appendChild(tr);
+            });
+        } catch(e) {}
+        
+    } else if (filterType === 'missing') {
+        headerRow.innerHTML = "<th>Store #</th><th>Last Checked</th>";
+        
+        let query = "SELECT store_id, last_checked FROM MissingStores";
+        query += buildWhere('');
+        query += " LIMIT 100";
+        
+        try{
+            const results = db.exec(query);
+            tbody.innerHTML = '';
+            
+            if (results.length === 0) {
+                tbody.innerHTML = "<tr><td colspan='2'>No nonexistent stores recorded.</td></tr>";
+                return;
+            }
+            
+            results[0].values.forEach(row => {
+                const tr = document.createElement('tr');
+                tr.innerHTML = `<td>${row[0]}</td><td>${row[1]}</td>`;
+                tbody.appendChild(tr);
+            });
+        } catch(e) {}
+    } else if (filterType === 'racks') {
+        headerRow.innerHTML = "<th>Store #</th><th>Rack Name</th><th>Network Address</th><th>EMS Type</th><th>Circuits Count</th><th>Action</th>";
+        
+        let query = `
+            SELECT r.store_id, r.rack_name, r.ems_type, COUNT(c.circuit_id), r.rack_id, r.host_address
+            FROM Racks r
+            LEFT JOIN Circuits c ON r.rack_id = c.rack_id
+        `;
+        query += buildWhere('r.');
+        query += " GROUP BY r.rack_id LIMIT 250";
+        
+        try {
+            const results = db.exec(query);
+            tbody.innerHTML = '';
+            
+            if (results.length === 0) {
+                tbody.innerHTML = "<tr><td colspan='6'>No racks found.</td></tr>";
+                return;
+            }
+            
+            // Build reusable dropdown
+            let selectOptionsHtml = "";
+            SUPPORTED_EMS_TYPES.forEach(t => {
+                selectOptionsHtml += `<option value="${t}">${t}</option>`;
+            });
+            selectOptionsHtml += `<option value="Other">Other</option>`;
+            
+            results[0].values.forEach(row => {
+                const rStoreId = row[0];
+                const rName = row[1];
+                const rEmsType = row[2];
+                const rCount = row[3];
+                const rId = row[4];
+                const rHost = row[5] || "";
+                
+                // Set explicitly selected type based on DB row
+                let typedOptionsHtml = selectOptionsHtml.replace(`value="${rEmsType}"`, `value="${rEmsType}" selected`);
+                if (!typedOptionsHtml.includes('selected')) {
+                    typedOptionsHtml = selectOptionsHtml; // fallback
+                }
+
+                // Make the network address clickable to copy it
+                const hostHtml = rHost ? `<span style="cursor:pointer; color:#007acc; text-decoration:underline;" onclick="navigator.clipboard.writeText('${rHost}').then(() => alert('Copied to clipboard!'))" title="Click to copy">${rHost}</span>` : "";
+
+                const tr = document.createElement('tr');
+                tr.innerHTML = `
+                    <td>${rStoreId}</td>
+                    <td>${rName}</td>
+                    <td>${hostHtml}</td>
+                    <td>
+                        <select id="data-edit-sel-${rId}" class="form-control" style="width:180px; padding:2px;">
+                            ${typedOptionsHtml}
+                        </select>
+                    </td>
+                    <td>${rCount}</td>
+                    <td>
+                        <button class="primary-button action-button" onclick="dataTableEditRack(${rId})" style="margin:0; padding:2px 8px; border:none; background:#007acc;">Save</button>
+                    </td>
+                `;
+                tbody.appendChild(tr);
+            });
+        } catch(e) {}
+    } else if (filterType === 'circuits') {
+        headerRow.innerHTML = "<th>Store #</th><th>Rack Name</th><th>Circuit Name</th>";
+        
+        let query = `
+            SELECT r.store_id, r.rack_name, c.circuit_name 
+            FROM Circuits c
+            JOIN Racks r ON c.rack_id = r.rack_id
+        `;
+        query += buildWhere('r.');
+        
+        try {
+            const results = db.exec(query);
+            tbody.innerHTML = '';
+            
+            if (results.length === 0) {
+                tbody.innerHTML = "<tr><td colspan='3'>No circuits found.</td></tr>";
+                return;
+            }
+            
+            results[0].values.forEach(row => {
+                const tr = document.createElement('tr');
+                tr.innerHTML = `<td>${row[0]}</td><td>${row[1]}</td><td>${row[2]}</td>`;
+                tbody.appendChild(tr);
+            });
+        } catch(e) {}
+    }
+}
+
+function renderReviewTable() {
+    if (!db) return;
+    const tbody = document.getElementById('review-body');
+    tbody.innerHTML = '';
+
+    const results = db.exec("SELECT rack_id, store_id, rack_name, ems_type, host_address FROM Racks WHERE needs_review = 1 LIMIT 50");
+    if (results.length === 0) {
+        tbody.innerHTML = "<tr><td colspan='6'>All good! No racks flag for review.</td></tr>";
+        return;
+    }
+    
+    // Patch header if needed
+    const reviewHead = document.querySelector('#reviewTab table thead tr');
+    if(reviewHead && !reviewHead.innerHTML.includes('Network Address')) {
+       reviewHead.innerHTML = "<th>Store #</th><th>Rack Name</th><th>Network Address</th><th>Initial Type</th><th>Correction</th><th>Action</th>";
+    }
+    
+    results[0].values.forEach(row => {
+        const rackId = row[0];
+        const storeId = row[1];
+        const rackName = row[2];
+        const emsType = row[3];
+        const hostAddress = row[4] || "";
+        
+        let selectOptions = "";
+        SUPPORTED_EMS_TYPES.forEach(t => {
+            selectOptions += `<option value="${t}">${t}</option>`;
+        });
+        selectOptions += `<option value="Other">Other</option>`;
+        
+        const hostHtml = hostAddress ? `<span style="cursor:pointer; color:#007acc; text-decoration:underline;" onclick="navigator.clipboard.writeText('${hostAddress}').then(() => alert('Copied to clipboard!'))" title="Click to copy">${hostAddress}</span>` : "";
+
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+            <td>${storeId}</td>
+            <td>${rackName}</td>
+            <td>${hostHtml}</td>
+            <td>${emsType}</td>
+            <td>
+                <select id="resolve-sel-${rackId}" class="form-control" style="width:150px">
+                    <option value="">Select...</option>
+                    ${selectOptions}
+                </select>
+            </td>
+            <td>
+                <button class="primary-button action-button" style="margin:0; padding:4px 8px; border:none; background:#007acc" onclick="resolveReview(${rackId})">Update</button>
+            </td>
+        `;
+        tbody.appendChild(tr);
+    });
+}
+
+// Identifies the rack by store + name because rack_id can differ between the in-memory copy and the shared file.
+function setRackType(rackId, emsType) {
+    const res = db.exec("SELECT store_id, rack_name FROM Racks WHERE rack_id = ?", [rackId]);
+    if (res.length === 0) return false;
+    const [storeId, rackName] = res[0].values[0];
+    commit(d => d.run("UPDATE Racks SET ems_type = ?, needs_review = 0 WHERE store_id = ? AND rack_name = ?", [emsType, storeId, rackName]));
+    return true;
+}
+
+function resolveReview(rackId) {
+    const sel = document.getElementById(`resolve-sel-${rackId}`);
+    if (!sel || !sel.value) return;
+    
+    setRackType(rackId, sel.value);
+    renderReviewTable();
+    updateReviewCount();
+}
+
+
+function exportSqliteData() {
+    if (!db) return;
+    const data = db.export();
+    const blob = new Blob([data], { type: "application/x-sqlite3" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `EMS_Scanner_DB_${new Date().toISOString().split('T')[0]}.sqlite`;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+        URL.revokeObjectURL(url);
+        a.remove();
+    }, 100);
+}
+
+function importSqliteData(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    if (SharedDb.isReady() && !confirm(`Importing replaces the contents of the shared file ${SharedDb.fileName()}. Continue?`)) {
+        event.target.value = '';
+        return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = async function() {
+        try {
+            const Uints = new Uint8Array(reader.result);
+            if (db) db.close(); // Close existing DB
+            db = new SQL.Database(Uints);
+            
+            // Check if host_address column exists, add if missing for backward compatibility
+            try {
+                db.run("ALTER TABLE Racks ADD COLUMN host_address TEXT");
+            } catch(e) {}
+            
+            saveToIndexedDB(); // Save imported db to IndexedDB
+            if (SharedDb.isReady()) await SharedDb.writeBytes(db.export());
+            
+            logMsg("Database successfully imported.", "info");
+            renderEmsTable();
+            updateReviewCount();
+            alert("Database successfully imported!");
+            
+            // Reset input so the same file can be selected again
+            event.target.value = '';
+        } catch(err) {
+            logMsg("Failed to import database: " + err.message, "error");
+            alert("Failed to import database. See log for details.");
+        }
+    };
+    reader.readAsArrayBuffer(file);
+}
+
+function dataTableEditRack(rackId) {
+    const sel = document.getElementById(`data-edit-sel-${rackId}`);
+    if (!sel || !sel.value) return;
+    
+    // Changing the type from the data table automatically verifies it implicitly
+    setRackType(rackId, sel.value);
+    updateReviewCount(); // Drop count if this happened to be unverified
+    alert("Rack updated and verified.");
+}
+
+// Development helper to export raw JSON format for LLM review
+
+async function clearData() {
+    if (confirm("Are you sure you want to delete the local SQLite Database and start fresh?" + (SharedDb.isReady() ? `\nThis also empties the shared file ${SharedDb.fileName()}.` : ""))) {
+        if (SharedDb.isReady()) {
+            try {
+                await SharedDb.mutate(d => {
+                    d.run("DELETE FROM Circuits");
+                    d.run("DELETE FROM Racks");
+                    d.run("DELETE FROM Stores");
+                    d.run("DELETE FROM MissingStores");
+                });
+            } catch (err) {
+                alert("Could not clear the shared file: " + err.message);
+                return;
+            }
+        }
+        db.close();
+        
+        // Wipe indexeddb
+        const req = indexedDB.deleteDatabase(IDB_NAME);
+        req.onsuccess = () => {
+            alert("Database cleared. The page will reload.");
+            window.location.reload();
+        };
+    }
+}
+
+// ----- Visualization / Dashboard -----
+let charts = {};
+
+function initChart(canvasId, type, data, options) {
+    if (charts[canvasId]) {
+        charts[canvasId].destroy();
+    }
+    const ctx = document.getElementById(canvasId).getContext('2d');
+    charts[canvasId] = new Chart(ctx, { type, data, options });
+}
+
+const COMMON_CHART_OPTIONS = {
+    responsive: true,
+    plugins: {
+        legend: { position: 'bottom', labels: { color: '#ccc' } }
+    }
+};
+
+const COMMON_BAR_OPTIONS = {
+    responsive: true,
+    plugins: {
+        legend: { display: false }
+    },
+    scales: {
+        y: { beginAtZero: true, grid: { color: '#444' }, ticks: { color: '#ccc' } },
+        x: { grid: { color: '#444' }, ticks: { color: '#ccc' } }
+    }
+};
+
+
+function renderCharts() {
+    if (!db) return;
+    
+    Chart.defaults.color = '#ccc';
+
+    // 1. EMS Types (Pie/Doughnut)
+    const emsTypesRes = db.exec("SELECT ems_type, COUNT(*) FROM Racks GROUP BY ems_type");
+    let emsLabels = [];
+    let emsData = [];
+    let emsColors = ['#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0', '#9966FF', '#FF9F40', '#E7E9ED', '#8bc34a', '#8bc34a'];
+    
+    if (emsTypesRes.length > 0) {
+        emsTypesRes[0].values.forEach(row => {
+            emsLabels.push(row[0] || 'Unknown');
+            emsData.push(row[1]);
+        });
+    }
+
+    initChart('chartEmsTypes', 'doughnut', {
+        labels: emsLabels,
+        datasets: [{ data: emsData, backgroundColor: emsColors }]
+    }, COMMON_CHART_OPTIONS);
+
+    // 2. Stores vs Nonexistent Stores
+    const storesCountRes = db.exec("SELECT COUNT(*) FROM Stores");
+    const missingCountRes = db.exec("SELECT COUNT(*) FROM MissingStores");
+    const storesCount = storesCountRes.length > 0 ? storesCountRes[0].values[0][0] : 0;
+    const missingCount = missingCountRes.length > 0 ? missingCountRes[0].values[0][0] : 0;
+
+    initChart('chartStoreStatus', 'pie', {
+        labels: ['Valid Scanned Stores', 'Nonexistent/Missing'],
+        datasets: [{ data: [storesCount, missingCount], backgroundColor: ['#4BC0C0', '#FF6384'] }]
+    }, COMMON_CHART_OPTIONS);
+
+    // 3. Stores with most racks
+    const topRacksRes = db.exec("SELECT store_id, COUNT(*) as c FROM Racks GROUP BY store_id ORDER BY c DESC LIMIT 10");
+    let racksLabels = [];
+    let racksData = [];
+    if (topRacksRes.length > 0) {
+        topRacksRes[0].values.forEach(row => {
+            racksLabels.push(`Store ${row[0]}`);
+            racksData.push(row[1]);
+        });
+    }
+    initChart('chartTopRacks', 'bar', {
+        labels: racksLabels,
+        datasets: [{ label: 'Racks', data: racksData, backgroundColor: '#36A2EB' }]
+    }, COMMON_BAR_OPTIONS);
+
+    // 4. Stores with most circuits
+    const topCircuitsRes = db.exec(`
+        SELECT r.store_id, COUNT(c.circuit_id) as cc 
+        FROM Racks r JOIN Circuits c ON r.rack_id = c.rack_id 
+        GROUP BY r.store_id ORDER BY cc DESC LIMIT 10
+    `);
+    let circLabels = [];
+    let circData = [];
+    if (topCircuitsRes.length > 0) {
+        topCircuitsRes[0].values.forEach(row => {
+            circLabels.push(`Store ${row[0]}`);
+            circData.push(row[1]);
+        });
+    }
+    initChart('chartTopCircuits', 'bar', {
+        labels: circLabels,
+        datasets: [{ label: 'Circuits', data: circData, backgroundColor: '#FFCE56' }]
+    }, COMMON_BAR_OPTIONS);
+
+    // 5. Low Temp vs Medium Temp vs Dual Temp
+    // Classification based on prefixes like LT, MT, DT with trailing letters or numbers
+    let lt = 0, mt = 0, dt = 0, rcu = 0, other = 0;
+    const tempRes = db.exec("SELECT rack_name FROM Racks");
+    if (tempRes.length > 0) {
+        tempRes[0].values.forEach(row => {
+            const name = (row[0] || "").toUpperCase();
+            if (/\b[CR]?LT[A-Z0-9]*\b/.test(name)) lt++;
+            else if (/\b[CR]?MT[A-Z0-9]*\b/.test(name)) mt++;
+            else if (/\b[CR]?DT[A-Z0-9]*\b/.test(name)) dt++;
+            else if (/\b[CR]?RCU[0-9A-Z]*\b/.test(name)) rcu++;
+            else other++;
+        });
+    }
+
+    initChart('chartTempTypes', 'pie', {
+        labels: ['Low Temp (LT*)', 'Medium Temp (MT*)', 'Dual Temp (DT*)', 'Condensing Unit (RCU*)', 'Other'],
+        datasets: [{ data: [lt, mt, dt, rcu, other], backgroundColor: ['#36A2EB', '#4BC0C0', '#9966FF', '#FF9F40', '#E7E9ED'] }]
+    }, COMMON_CHART_OPTIONS);
+
+    // 6. Time series data
+    // Plotting cumulative totals grouped by Date (YYYY-MM-DD)
+    const timeRes = db.exec(`
+        SELECT date(last_scanned), COUNT(*) 
+        FROM Stores 
+        WHERE last_scanned IS NOT NULL 
+        GROUP BY date(last_scanned) ORDER BY date(last_scanned) ASC
+    `);
+    const misTimeRes = db.exec(`
+        SELECT date(last_checked), COUNT(*) 
+        FROM MissingStores 
+        WHERE last_checked IS NOT NULL 
+        GROUP BY date(last_checked) ORDER BY date(last_checked) ASC
+    `);
+    
+    let dates = new Set();
+    let storeSeries = {};
+    let missingSeries = {};
+    
+    if (timeRes.length > 0) {
+        timeRes[0].values.forEach(row => { dates.add(row[0]); storeSeries[row[0]] = row[1]; });
+    }
+    if (misTimeRes.length > 0) {
+        misTimeRes[0].values.forEach(row => { dates.add(row[0]); missingSeries[row[0]] = row[1]; });
+    }
+    
+    let sortedDates = Array.from(dates).sort();
+    let validScansLineCount = [];
+    let missingScansLineCount = [];
+    
+    // Convert to cumulative or raw per-day
+    sortedDates.forEach(d => {
+        validScansLineCount.push(storeSeries[d] || 0);
+        missingScansLineCount.push(missingSeries[d] || 0);
+    });
+
+    initChart('chartTimeSeries', 'line', {
+        labels: sortedDates,
+        datasets: [
+            { label: 'Valid Stores Scanned', data: validScansLineCount, borderColor: '#4BC0C0', backgroundColor: 'rgba(75, 192, 192, 0.2)', fill: true, tension: 0.1 },
+            { label: 'Nonexistent/Missing', data: missingScansLineCount, borderColor: '#FF6384', backgroundColor: 'rgba(255, 99, 132, 0.2)', fill: true, tension: 0.1 }
+        ]
+    }, {
+        responsive: true,
+        plugins: { legend: { position: 'bottom', labels: { color: '#ccc'} } },
+        scales: {
+            y: { beginAtZero: true, grid: { color: '#444' }, ticks: { color: '#ccc' } },
+            x: { grid: { color: '#444' }, ticks: { color: '#ccc' } }
+        }
+    });
+
+}
+
+// ----- Scheduled scan -----
+
+const SCHEDULE_KEY = 'emsMapperSchedule';
+const schedule = { mode: 'off', time: '02:00', day: 1, lastRun: 0 };
+let scheduleWarnedFor = 0;
+
+function scanBlocker() {
+    if (!db) return 'database is not loaded yet.';
+    if (typeof window.GM_fetch === 'undefined') return 'Tampermonkey CORS proxy `GM_fetch` not found. Install the userscript and run inside the browser.';
+    if (SharedDb.isLinked() && !SharedDb.isReady()) return 'the shared database file is linked but access has not been re-granted. Click Reconnect.';
+    return null;
+}
+
+function loadSchedule() {
+    try { Object.assign(schedule, JSON.parse(localStorage.getItem(SCHEDULE_KEY) || '{}')); } catch (e) {}
+    document.getElementById('sched-mode').value = schedule.mode;
+    document.getElementById('sched-day').value = String(schedule.day);
+    document.getElementById('sched-time').value = schedule.time;
+    updateScheduleStatus();
+}
+
+function persistSchedule() {
+    localStorage.setItem(SCHEDULE_KEY, JSON.stringify(schedule));
+}
+
+function saveSchedule() {
+    schedule.mode = document.getElementById('sched-mode').value;
+    schedule.day = parseInt(document.getElementById('sched-day').value, 10);
+    schedule.time = document.getElementById('sched-time').value || '02:00';
+    // A changed schedule starts counting from now so earlier slots are not treated as missed.
+    schedule.lastRun = Date.now();
+    persistSchedule();
+    updateScheduleStatus();
+}
+
+// Most recent scheduled slot at or before `now`.
+function scheduledOccurrence(now) {
+    const [h, m] = schedule.time.split(':').map(Number);
+    const d = new Date(now);
+    d.setHours(h, m, 0, 0);
+    if (schedule.mode === 'weekly') {
+        d.setDate(d.getDate() - ((d.getDay() - schedule.day + 7) % 7));
+        if (d > now) d.setDate(d.getDate() - 7);
+    } else if (d > now) {
+        d.setDate(d.getDate() - 1);
+    }
+    return d;
+}
+
+function updateScheduleStatus() {
+    const el = document.getElementById('sched-status');
+    document.getElementById('sched-day').style.display = schedule.mode === 'weekly' ? '' : 'none';
+    document.getElementById('sched-time').style.display = schedule.mode === 'off' ? 'none' : '';
+    if (schedule.mode === 'off') {
+        el.textContent = 'Scheduled scan is off.';
+        return;
+    }
+    const occ = scheduledOccurrence(new Date());
+    const due = schedule.lastRun < occ.getTime();
+    const next = new Date(occ);
+    if (!due) next.setDate(next.getDate() + (schedule.mode === 'weekly' ? 7 : 1));
+    const last = schedule.lastRun ? new Date(schedule.lastRun).toLocaleString() : 'never';
+    el.textContent = `Next run: ${due ? 'due now' : next.toLocaleString()} | Last run: ${last}`;
+}
+
+async function checkSchedule() {
+    if (schedule.mode === 'off' || isScanning || !db) return;
+    const occ = scheduledOccurrence(new Date());
+    if (schedule.lastRun >= occ.getTime()) return;
+
+    const blocker = scanBlocker();
+    if (blocker) {
+        if (scheduleWarnedFor !== occ.getTime()) {
+            scheduleWarnedFor = occ.getTime();
+            logMsg(`Scheduled scan is waiting: ${blocker}`, 'warn');
+        }
+        return;
+    }
+
+    schedule.lastRun = Date.now();
+    persistSchedule();
+    updateScheduleStatus();
+    logMsg('Scheduled scan starting...', 'info');
+
+    await syncFromShared();
+    const res = db.exec("SELECT store_id FROM Stores ORDER BY store_id");
+    const ids = res.length > 0 ? res[0].values.map(r => r[0]) : [];
+    if (ids.length === 0) {
+        logMsg('Scheduled scan skipped: no previously scanned stores.', 'warn');
+        return;
+    }
+    await startScan(ids);
+    updateScheduleStatus();
+}
+
+// Window init
+window.onload = () => {
+    // Delay slightly to let UI render before loading WASM
+    setTimeout(initDB, 100);
+};
+
 </script>
 </body>
 </html>
