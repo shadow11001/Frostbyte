@@ -1,20 +1,22 @@
 // ==UserScript==
 // @name         Frostbyte CORS Proxy
 // @namespace    http://tampermonkey.net/
-// @version      1.0
-// @description  Bypasses CORS for Frostbyte standalone file to pull ServiceChannel data
+// @version      1.1
+// @description  Bypasses CORS for Frostbyte standalone file to pull ServiceChannel, SAOne and Crystal data
 // @author       You
 // @match        file:///*
 // @match        https://em.walmart.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue
+// @connect      crystal.walmart.com
 // ==/UserScript==
 
 (function() {
     'use strict';
 
-    // ---- TOKEN SNIFFER (runs on em.walmart.com) ----
+    // ---- LEGACY IOT TOKEN SNIFFER (runs on em.walmart.com) ----
+    // Frostbyte now uses Crystal (below); the IOT handlers are kept only until IOT is retired.
     if (window.location.hostname === 'em.walmart.com') {
         const origOpen = XMLHttpRequest.prototype.open;
         const origSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
@@ -352,6 +354,99 @@
             }
         });
     });
+    // ---- CRYSTAL (replaces IOT) ----
+    // Crystal authenticates with the browser's crystal.walmart.com session cookie, so no token is needed.
+    // Sign in at https://crystal.walmart.com/ once and keep that session alive.
+    const CRYSTAL_API = 'https://crystal.walmart.com/api/asset-browser/v1';
+    const CRYSTAL_LOGIN_MSG = 'Not signed in to Crystal. Open https://crystal.walmart.com/ in this browser, sign in, then try again.';
+    const CRYSTAL_READINGS_TTL_MS = 30000;
+    const crystalReadingsCache = {};
+
+    function crystalGet(path) {
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: CRYSTAL_API + path,
+                headers: {
+                    "Accept": "application/json, text/plain, */*",
+                    "x-tenant": "us"
+                },
+                onload: function(res) {
+                    if (res.status === 401 || res.status === 403) return reject(new Error(CRYSTAL_LOGIN_MSG));
+                    if (res.status < 200 || res.status >= 300) return reject(new Error(`Invalid status ${res.status}`));
+                    const text = (res.responseText || '').trim();
+                    // An expired session redirects to an HTML login page with a 200.
+                    if (text.startsWith('<')) return reject(new Error(CRYSTAL_LOGIN_MSG));
+                    try {
+                        resolve(JSON.parse(text));
+                    } catch (err) {
+                        reject(new Error('Failed to parse Crystal response: ' + err.message));
+                    }
+                },
+                onerror: function() { reject(new Error('Network error contacting Crystal')); },
+                ontimeout: function() { reject(new Error('Crystal request timed out')); }
+            });
+        });
+    }
+
+    // kind is 'refrigeration' or 'hvac'. Readings are cached briefly so many sensor lookups share one request.
+    function crystalLatestReadings(storeNum, kind, force) {
+        const cacheKey = `${storeNum}|${kind}`;
+        const cached = crystalReadingsCache[cacheKey];
+        if (cached && !force && Date.now() - cached.ts < CRYSTAL_READINGS_TTL_MS) return cached.promise;
+        const promise = crystalGet(`/asset-hierarchy/${encodeURIComponent(storeNum)}/${kind}/latest-readings`);
+        crystalReadingsCache[cacheKey] = { ts: Date.now(), promise: promise };
+        promise.catch(() => { delete crystalReadingsCache[cacheKey]; });
+        return promise;
+    }
+
+    // Payload: { refrigeration, hvac, readings } where readings maps uniqueId -> latest reading.
+    window.addEventListener('fetchFromCrystal', function(e) {
+        if (!e.detail || !e.detail.storeNumber) return;
+        const storeNum = e.detail.storeNumber;
+        const enc = encodeURIComponent(storeNum);
+
+        Promise.allSettled([
+            crystalGet(`/asset-hierarchy/${enc}/refrigeration`),
+            crystalGet(`/asset-hierarchy/${enc}/hvac`),
+            crystalLatestReadings(storeNum, 'refrigeration', true),
+            crystalLatestReadings(storeNum, 'hvac', true)
+        ]).then(([refrigeration, hvac, refReadings, hvacReadings]) => {
+            if (refrigeration.status === 'rejected' && hvac.status === 'rejected') {
+                return window.dispatchEvent(new CustomEvent('crystalDataReady', { detail: { storeNumber: storeNum, error: refrigeration.reason.message } }));
+            }
+            const readings = {};
+            [refReadings, hvacReadings].forEach(r => {
+                if (r.status !== 'fulfilled') return;
+                // Module-level entries (e.g. comm loss) have no uniqueId, so they stay keyed by their asset id.
+                Object.entries(r.value || {}).forEach(([key, v]) => { if (v) readings[v.uniqueId || key] = v; });
+            });
+            window.dispatchEvent(new CustomEvent('crystalDataReady', { detail: {
+                storeNumber: storeNum,
+                data: {
+                    refrigeration: refrigeration.status === 'fulfilled' ? refrigeration.value : null,
+                    hvac: hvac.status === 'fulfilled' ? hvac.value : null,
+                    readings: readings
+                }
+            } }));
+        });
+    });
+
+    window.addEventListener('fetchSensorReadingCrystal', function(e) {
+        if (!e.detail || !e.detail.storeNumber || !e.detail.uniqueId) return;
+        const storeNum = e.detail.storeNumber;
+        const uniqueId = e.detail.uniqueId;
+        const kind = e.detail.kind === 'hvac' ? 'hvac' : 'refrigeration';
+
+        crystalLatestReadings(storeNum, kind, false).then(all => {
+            const reading = Object.values(all || {}).find(v => v && v.uniqueId === uniqueId) || null;
+            window.dispatchEvent(new CustomEvent('crystalSensorReadingReady', { detail: { storeNumber: storeNum, uniqueId: uniqueId, data: reading } }));
+        }).catch(err => {
+            window.dispatchEvent(new CustomEvent('crystalSensorReadingReady', { detail: { storeNumber: storeNum, uniqueId: uniqueId, error: err.message } }));
+        });
+    });
+
+    // ---- LEGACY IOT HANDLERS ----
     window.addEventListener('fetchFromIOT', function(e) {
         if (!e.detail || !e.detail.storeNumber) return;
         

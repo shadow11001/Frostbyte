@@ -1,5 +1,12 @@
 {
+  "scripts": {
+    "test:all-in-one": "node --test development/programs/tests/all-in-one-v7.test.js"
+  },
   "dependencies": {
-    "jsdom": "^29.1.1"
+    "autoprefixer": "^10.5.4",
+    "jsdom": "^29.1.1",
+    "postcss": "^8.5.26",
+    "postcss-import": "^16.1.1",
+    "tailwindcss": "^3.4.17"
   }
 }

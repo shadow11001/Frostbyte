@@ -116,6 +116,19 @@ A comprehensive, self-contained web application designed for Upstream Digital As
 2. **Open** in any modern web browser
 3. **Start using** - No installation or setup required!
 
+### QA Notes & Escalation Tool
+1. Open `development/programs/All_In_1_v7.html` directly in current Chrome or Edge.
+2. Select a Service Channel notes template or escalation type and complete the required fields.
+3. Use **Notes Log** to create or select a daily text file. The browser will request read/write permission for that file.
+
+The notes and escalation workflows work as a standalone HTML file. Clipboard and Notes Log actions require browser permission, and Notes Log uses the File System Access API available in current Chrome and Edge desktop. Draft technician, store, and work-order data is kept only in the open page and is not persisted to `localStorage`.
+
+Run its focused regression suite from the repository root:
+
+```bash
+npm run test:all-in-one
+```
+
 ### Analytics Dashboard
 1. **Navigate** to the `analytics/` folder
 2. **Open** `index.html` in a modern web browser
@@ -301,7 +314,7 @@ Click the **"Advanced Settings"** button in the settings panel to access:
 - Help Desk Post
 - Condenser and Compressor Staging Changes
 - Changes to Rack Suction Settings
-- Reporting Issues with IoT
+- Crystal Reporting Error
 - Setting MAC Addresses for Controller Replacements
 - Controller COMM Loss Related to Network & Cabling
 - Changing Board Points in Danfoss or CPC
@@ -312,6 +325,10 @@ Click the **"Advanced Settings"** button in the settings panel to access:
 - Program Change Request
 - RTU Fans Mode
 - Parameter Deviation
+- Refrigeration Troubleshooting
+- Comm Loss Troubleshooting
+- Point Change Request
+- Suppression Request
 - Swap Work Order
 - Mastermind Work Order
 

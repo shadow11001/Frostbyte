@@ -181,6 +181,11 @@
     <!-- Review Tab (For Flagged Items) -->
     <div id="reviewTab" class="tab-content">
         <p>The following stores were flagged because they have an EMS type of "OPUS" (needs manual confirmation as Opus Architect or Opus Magnum) or an unknown/unsupported EMS type.</p>
+        <div class="panel-card" id="opus-review-card" style="margin-bottom: 15px;">
+            <h3>Opus Review by Store</h3>
+            <div id="opus-review-body"></div>
+            <p class="hint">Check the racks that are Opus Architect. Every other OPUS rack at that store is set to Opus Magnum.</p>
+        </div>
         <div class="table-container" style="overflow-x: auto; max-height: 500px; overflow-y: auto;">
             <table class="ems-table" id="review-table">
                 <thead>
@@ -260,9 +265,10 @@ let SQL;
 let isScanning = false;
 let stopRequested = false;
 
-// Token mapping from previous API request analysis
-const API_TOKEN = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuYW1lX2lkIjoidm41ODBmYyIsImZpcnN0X25hbWUiOiJBbmRyZXciLCJsYXN0X25hbWUiOiJUb290aG1hbiIsInVzZXJfSUQiOiJ2bjU4MGZjIiwiZnVsbF9uYW1lIjoiQW5kcmV3IFRvb3RobWFuIC0gdm41ODBmYyIsImFkR3JvdXBzIjpbIldFSW9UIFVTIEJ1aWxkaW5nIFBlcmZvcm1hbmNlIE1hbmFnZXJzIiwiV0VJb1QgVVMgRGlnaXRhbCBBc3NldHMiLCJXRUlvVCBVUyBJbnNvdXJjZSJdLCJyZWxheVN0YXRlIjoic2Vuc29ycyIsImlhdCI6MTc4MzU5OTI0M30.8so7HSFI_ZknK25xWrCAhqOhkfrPx80x0IGRr9puVeA';
-const API_URL = 'https://weiot-em-telemetryapi.prod.walmart.com/api/sensors/getsensorhierarchy';
+// Crystal authenticates with the browser's crystal.walmart.com session cookie (sent by the Tampermonkey proxy).
+const CRYSTAL_API = 'https://crystal.walmart.com/api/asset-browser/v1';
+const CRYSTAL_LOGIN_MSG = 'Not signed in to Crystal. Open https://crystal.walmart.com/ in this browser, sign in, then rescan.';
+const CRYSTAL_VENDORS = { O: 'OPUS', N: 'NOVAR', E: 'EMERSON', C: 'CAREL', D: 'DANFOSS' };
 
 const SUPPORTED_EMS_TYPES = [
     'Danfoss AKA65', 'Danfoss Storeview',
@@ -811,52 +817,131 @@ function stopScan() {
 
 // ----- Parsing API Logic -----
 
+class CrystalAuthError extends Error {}
+
+// Resolves to parsed JSON, or null when Crystal has nothing for the store (404/400/204/empty body).
+async function crystalFetch(path) {
+    const response = await window.GM_fetch(CRYSTAL_API + path, {
+        method: 'GET',
+        headers: { 'Accept': 'application/json, text/plain, */*', 'x-tenant': 'us' }
+    });
+    if (response.status === 401 || response.status === 403) throw new CrystalAuthError(CRYSTAL_LOGIN_MSG);
+    if (response.status === 404 || response.status === 400 || response.status === 204) return null;
+    if (!response.ok) throw new Error(`HTTP Error ${response.status}: ${response.statusText}`);
+
+    const text = ((await response.text()) || '').trim();
+    if (!text || text === 'undefined') return null;
+    // An expired session redirects to an HTML sign-in page with a 200.
+    if (text.startsWith('<')) throw new CrystalAuthError(CRYSTAL_LOGIN_MSG);
+    return JSON.parse(text);
+}
+
+// Converts Crystal's refrigeration/HVAC asset hierarchies into the rack/circuit tree applyStoreData reads:
+// { value, label, key, children: [ { value: rackIndex, rackName, emsVendor, children: [circuit/module nodes] } ] }.
+// Returns null when the store has no racks or HVAC units.
+function crystalToHierarchy(storeId, refrigeration, hvac) {
+    const walk = (node, fn) => {
+        fn(node);
+        (node.assetNode || []).forEach(child => walk(child, fn));
+    };
+    const racks = [];
+
+    for (const rack of (refrigeration && refrigeration.assetNode) || []) {
+        if (rack.type !== 'Rack') continue;
+        const props = rack.additionalProperties || {};
+        const rackIndex = parseInt(props.rackIndex !== undefined && props.rackIndex !== null ? props.rackIndex : rack.rackIndex, 10);
+        if (!Number.isFinite(rackIndex)) continue;
+
+        const vendor = String(props.vendorType || '').toUpperCase();
+        const children = [];
+        const boards = new Set();
+
+        walk(rack, n => {
+            if (n.type === 'Circuit Names' && n.label) {
+                children.push({ label: n.label, key: n.id, category: 'circuit', circuitName: n.label, modLabelForGrouping: n.label });
+            } else if (n.type === 'Rack Part Sensors' && n.telemetryLabel && n.telemetryLabel.includes('|')) {
+                // telemetryLabel is "RACK|BOARD", e.g. "LTA|COM16"
+                boards.add(n.telemetryLabel.split('|').pop().trim());
+            } else if (n.type === 'Modules' && n.label) {
+                boards.add(n.label);
+            }
+        });
+        // Board entries let applyStoreData detect an XCM20R (Opus Architect); the 'rack' category keeps them out of the circuit list.
+        boards.forEach(b => children.push({ label: b, key: `${rack.id}|${b}`, category: 'rack', modLabelForGrouping: b }));
+
+        racks.push({
+            value: rackIndex,
+            label: `${props.rackLabel || rack.label} (${CRYSTAL_VENDORS[vendor] || vendor || 'Unknown'})`,
+            key: `US|${storeId}|${vendor}|${rackIndex}`,
+            rackName: String(props.rackLabel || rack.label).trim(),
+            emsVendor: CRYSTAL_VENDORS[vendor] || vendor || 'Unknown',
+            children: children
+        });
+    }
+
+    // HVAC has no rack node: each module carries its controller's rack index, and the vendor is in its sensors' uniqueIds.
+    const hvacGroups = new Map();
+    if (hvac && hvac.assetNode) {
+        walk(hvac, n => {
+            if (n.type !== 'HVAC Modules' || !n.label) return;
+            const rackIndex = parseInt(n.rackIndex, 10);
+            if (!Number.isFinite(rackIndex)) return;
+            const sensor = (n.assetNode || []).find(c => c.uniqueId);
+            const vendor = sensor ? String(sensor.uniqueId).split('|')[2] || '' : '';
+            const groupKey = `${vendor}|${rackIndex}`;
+            if (!hvacGroups.has(groupKey)) hvacGroups.set(groupKey, { vendor, rackIndex, children: [] });
+            hvacGroups.get(groupKey).children.push({
+                label: n.label,
+                key: n.id,
+                category: 'hvac',
+                circuitName: n.label.split(/\s+/)[0], // "RG08 OPTICAL SALES" -> "RG08"
+                modLabelForGrouping: n.label
+            });
+        });
+    }
+    const usedNames = new Set(racks.map(r => r.rackName.toUpperCase()));
+    [...hvacGroups.values()].sort((a, b) => a.rackIndex - b.rackIndex).forEach(g => {
+        const vendor = String(g.vendor).toUpperCase();
+        const emsVendor = CRYSTAL_VENDORS[vendor] || vendor || 'Unknown';
+        // Novar controllers also run lighting, matching the names IOT used.
+        let name = vendor === 'N' ? 'HVAC/LIGHTS' : 'HVAC';
+        if (usedNames.has(name.toUpperCase())) name = `${name} ${g.rackIndex}`;
+        usedNames.add(name.toUpperCase());
+        racks.push({
+            value: g.rackIndex,
+            label: `${name} (${emsVendor})`,
+            key: `US|${storeId}|${vendor}|${g.rackIndex}`,
+            rackName: name,
+            emsVendor: emsVendor,
+            children: g.children
+        });
+    });
+
+    if (racks.length === 0) return null;
+    return { value: storeId, label: `Store ${storeId}`, key: `US|${storeId}`, children: racks };
+}
+
 async function scanStore(storeId) {
     try {
-        const response = await window.GM_fetch(API_URL, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': API_TOKEN,
-                'x-tenant': 'US',
-                'lang': 'en',
-                'origin': 'https://em.walmart.com'
-            },
-            body: JSON.stringify({"cc": "US", "storeNo": storeId, "rackIndex": null, "sensorIOType": null})
-        });
+        const [refrigeration, hvac] = await Promise.all([
+            crystalFetch(`/asset-hierarchy/${storeId}/refrigeration`),
+            crystalFetch(`/asset-hierarchy/${storeId}/hvac`)
+        ]);
 
-        if (!response.ok) {
-            if (response.status === 404 || response.status === 400 || response.status === 500) {
-                // Assuming an error like 404 means nonexistent
-                logMsg(`Store ${storeId} got HTTP ${response.status}. Marking as nonexistent.`, 'warn');
-                markStoreMissing(storeId);
-            } else {
-                throw new Error(`HTTP Error ${response.status}: ${response.statusText}`);
-            }
-            return;
-        }
-
-        const textResponse = await response.text();
-        if (!textResponse || textResponse.trim() === '' || textResponse === 'undefined') {
-            logMsg(`Store ${storeId} returned empty response. Marking as nonexistent.`, 'warn');
+        const data = crystalToHierarchy(storeId, refrigeration, hvac);
+        if (!data) {
+            logMsg(`Store ${storeId} has no refrigeration or HVAC assets in Crystal. Marking as nonexistent.`, 'warn');
             markStoreMissing(storeId);
             return;
         }
-        
-        const data = JSON.parse(textResponse);
-        
-        // If API returns an empty shell or something indicating it doesnt exist though 200 OK
-        if(!data || typeof data.value === 'undefined') {
-            logMsg(`Store ${storeId} returned ok, but data has no 'value'. Marking as nonexistent.`, 'warn');
-            markStoreMissing(storeId);
-            return;
-        }
-        
-        // It's a valid store
+
         saveStoreData(storeId, data);
-        
     } catch(err) {
         logMsg(`Store ${storeId} Failed: ${err.message}`, 'error');
+        if (err instanceof CrystalAuthError) {
+            // Every remaining store would fail the same way.
+            stopRequested = true;
+        }
     }
 }
 
@@ -982,7 +1067,11 @@ function applyStoreData(db, storeId, data) {
         let rawEmsType = "Unknown";
         
         const match = labelStr.match(/^(.*?)\s*\((.*?)\)$/);
-        if (match) {
+        if (child.rackName && child.emsVendor) {
+            // Crystal supplies these directly, so there is no label to parse.
+            rawRackName = child.rackName;
+            rawEmsType = child.emsVendor;
+        } else if (match) {
             rawRackName = match[1].trim();
             rawEmsType = match[2].trim();
         }
@@ -1284,6 +1373,7 @@ function renderEmsTable() {
 
 function renderReviewTable() {
     if (!db) return;
+    renderOpusReview();
     const tbody = document.getElementById('review-body');
     tbody.innerHTML = '';
 
@@ -1332,6 +1422,132 @@ function renderReviewTable() {
         `;
         tbody.appendChild(tr);
     });
+}
+
+// ----- Opus review by store -----
+// Walks every store that still has OPUS racks needing review. The user checks the racks that are
+// Opus Architect; every other pending OPUS rack at that store becomes Opus Magnum.
+const opusReview = { active: false, queue: [], pos: 0 };
+
+function opusPendingRacks(storeId) {
+    const res = db.exec("SELECT rack_name, host_address FROM Racks WHERE store_id = ? AND needs_review = 1 AND UPPER(ems_type) = 'OPUS' ORDER BY rack_name", [storeId]);
+    return res.length > 0 ? res[0].values.map(r => ({ name: r[0], host: r[1] || '' })) : [];
+}
+
+function opusPendingStores() {
+    const res = db.exec("SELECT DISTINCT store_id FROM Racks WHERE needs_review = 1 AND UPPER(ems_type) = 'OPUS' ORDER BY store_id");
+    return res.length > 0 ? res[0].values.map(r => r[0]) : [];
+}
+
+function startOpusReview() {
+    opusReview.queue = opusPendingStores();
+    opusReview.pos = 0;
+    opusReview.active = opusReview.queue.length > 0;
+    renderOpusReview();
+}
+
+function stopOpusReview() {
+    opusReview.active = false;
+    renderOpusReview();
+}
+
+// Moves to the next (delta 1) or previous (delta -1) store that still has pending OPUS racks.
+function opusReviewMove(delta) {
+    let p = opusReview.pos + delta;
+    while (p >= 0 && p < opusReview.queue.length && opusPendingRacks(opusReview.queue[p]).length === 0) p += delta;
+    if (p >= 0) opusReview.pos = p;
+    renderOpusReview();
+}
+
+function applyOpusReview(storeId, architectNames, allNames) {
+    const architect = new Set(architectNames.map(n => n.toUpperCase()));
+    const assignments = allNames.map(name => [name, architect.has(name.toUpperCase()) ? 'Opus Architect' : 'Opus Magnum']);
+    commit(d => assignments.forEach(([name, type]) => {
+        d.run("UPDATE Racks SET ems_type = ?, needs_review = 0 WHERE store_id = ? AND UPPER(rack_name) = UPPER(?)", [type, storeId, name]);
+    }));
+    logMsg(`Store ${storeId}: ` + assignments.map(([n, t]) => `${n} → ${t}`).join(', '), 'info');
+}
+
+function renderOpusReview() {
+    const body = document.getElementById('opus-review-body');
+    if (!body || !db) return;
+    body.innerHTML = '';
+
+    const mk = (tag, props, text) => {
+        const el = document.createElement(tag);
+        if (props) Object.assign(el, props);
+        if (text !== undefined) el.textContent = text;
+        return el;
+    };
+    const button = (text, cls, onclick) => {
+        const b = mk('button', { className: cls, type: 'button' }, text);
+        b.onclick = onclick;
+        return b;
+    };
+
+    if (!opusReview.active) {
+        const stores = opusPendingStores();
+        if (stores.length === 0) {
+            body.appendChild(mk('div', { style: 'color:#aaa' }, 'No OPUS racks are waiting for review.'));
+            return;
+        }
+        body.appendChild(mk('div', { style: 'color:#aaa; margin-bottom:10px' }, `${stores.length} store(s) have OPUS racks that still need to be classified.`));
+        body.appendChild(button('Start Review', 'primary-button', startOpusReview));
+        return;
+    }
+
+    // Stores resolved elsewhere (e.g. in Frostbyte) while reviewing are skipped.
+    let racks = [];
+    while (opusReview.pos < opusReview.queue.length) {
+        racks = opusPendingRacks(opusReview.queue[opusReview.pos]);
+        if (racks.length > 0) break;
+        opusReview.pos++;
+    }
+
+    if (racks.length === 0) {
+        opusReview.active = false;
+        const remaining = opusPendingStores().length;
+        body.appendChild(mk('div', { style: 'color:#4caf50; margin-bottom:10px' }, remaining === 0 ? 'Every OPUS rack has been classified.' : `Review finished. ${remaining} store(s) were skipped.`));
+        if (remaining > 0) body.appendChild(button('Review Skipped Stores', 'primary-button', startOpusReview));
+        return;
+    }
+
+    const storeId = opusReview.queue[opusReview.pos];
+    body.appendChild(mk('div', { style: 'margin-bottom:10px; font-size:1.1em' }, `Store ${storeId} (${opusReview.pos + 1} of ${opusReview.queue.length})`));
+
+    const boxes = racks.map(r => {
+        const label = mk('label', { style: 'display:flex; align-items:center; gap:8px; padding:4px 0; cursor:pointer' });
+        const box = mk('input', { type: 'checkbox', value: r.name });
+        label.appendChild(box);
+        label.appendChild(document.createTextNode(r.name));
+        if (r.host) label.appendChild(mk('span', { style: 'color:#888; font-size:12px' }, r.host));
+        body.appendChild(label);
+        return box;
+    });
+
+    const summary = mk('div', { style: 'color:#aaa; margin:10px 0; font-size:13px' });
+    const refresh = () => {
+        const arch = boxes.filter(b => b.checked).map(b => b.value);
+        const mag = boxes.filter(b => !b.checked).map(b => b.value);
+        summary.textContent = `Opus Architect: ${arch.join(', ') || 'none'} | Opus Magnum: ${mag.join(', ') || 'none'}`;
+    };
+    boxes.forEach(b => b.addEventListener('change', refresh));
+    refresh();
+    body.appendChild(summary);
+
+    const row = mk('div', { style: 'display:flex; gap:10px; flex-wrap:wrap' });
+    row.appendChild(button('← Back', 'secondary-button', () => opusReviewMove(-1)));
+    row.appendChild(button('Select All', 'secondary-button', () => { boxes.forEach(b => { b.checked = true; }); refresh(); }));
+    row.appendChild(button('Clear', 'secondary-button', () => { boxes.forEach(b => { b.checked = false; }); refresh(); }));
+    row.appendChild(button('Skip', 'secondary-button', () => opusReviewMove(1)));
+    row.appendChild(button('Apply & Next', 'primary-button', () => {
+        applyOpusReview(storeId, boxes.filter(b => b.checked).map(b => b.value), racks.map(r => r.name));
+        updateReviewCount();
+        opusReviewMove(1);
+        renderReviewTable();
+    }));
+    row.appendChild(button('Stop', 'danger-button', stopOpusReview));
+    body.appendChild(row);
 }
 
 // Identifies the rack by store + name because rack_id can differ between the in-memory copy and the shared file.
