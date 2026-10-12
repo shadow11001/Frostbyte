@@ -109,6 +109,18 @@
         
         <div class="log-container" id="scan-log"></div>
 
+        <div class="panel-card" id="capture-card">
+            <h3>Crystal JSON Capture</h3>
+            <label style="display:flex; align-items:center; gap:8px; margin-bottom:8px;">
+                <input type="checkbox" id="capture-toggle" onchange="setCaptureEnabled(this.checked)"> Save the raw Crystal JSON for every scanned store
+            </label>
+            <div class="ems-controls" style="margin-bottom:0; flex-wrap:wrap; align-items:center;">
+                <button class="secondary-button" id="capture-folder-btn" onclick="pickCaptureFolder()" style="display:none">📁 Choose Folder</button>
+                <span id="capture-status" style="color:#aaa;"></span>
+            </div>
+            <p class="hint">Writes Store_&lt;n&gt;_Crystal_Dump.json with the raw refrigeration and HVAC responses, Crystal's own rack list, the converted racks, the racks actually saved and any parsing warnings. Scan a single store (start = end) to inspect one. Scheduled scans only capture once a folder has been chosen.</p>
+        </div>
+
         <div class="panel-card" id="shared-db-card">
             <h3>Shared Database File</h3>
             <div id="shared-db-status" style="color:#aaa; margin-bottom:10px;"></div>
@@ -493,6 +505,7 @@ async function initDB() {
     }
 
     updateSharedUi();
+    updateCaptureUi();
     updateReviewCount();
     loadSchedule();
     setInterval(checkSchedule, 60000);
@@ -737,6 +750,11 @@ async function startScan(presetList) {
         return;
     }
 
+    // The folder picker needs the click that started the scan, so ask before any awaits.
+    if (crystalCapture.enabled && !presetList && !crystalCapture.dir && window.showDirectoryPicker) {
+        if (!await pickCaptureFolder()) logMsg('No capture folder chosen; dumps will download as files.', 'warn');
+    }
+
     // Pick up edits made in Frostbyte (e.g. Opus classifications) before scanning.
     await syncFromShared();
 
@@ -779,7 +797,7 @@ async function startScan(presetList) {
         
         statusEl.innerText = `Scanning Store ${storeId}...`;
 
-        await scanStore(storeId);
+        await scanStore(storeId, !!presetList);
         
         // Progress update
         completed++;
@@ -836,23 +854,82 @@ async function crystalFetch(path) {
     return JSON.parse(text);
 }
 
+// Maps Crystal's vendorType (a letter like "O", or a combination like "O, N") to an EMS vendor name.
+// Returns { letters, name }: name is null when the value is missing or ambiguous.
+function parseCrystalVendor(raw) {
+    const tokens = String(raw === undefined || raw === null ? '' : raw).toUpperCase().split(/[\s,/|&+;]+/).filter(Boolean);
+    const names = [...new Set(tokens.map(t => CRYSTAL_VENDORS[t] || t))];
+    return { letters: tokens, name: names.length === 1 ? names[0] : null };
+}
+
+// Vendor letter and rack index from a sensor uniqueId such as "US|298|O|2|SpectrumA|16|1|OUTPUT|DIGITAL".
+function sensorOwner(node) {
+    let found = null;
+    const visit = n => {
+        if (found) return;
+        if (n.uniqueId && /^[A-Z]{2}\|\d+\|/i.test(n.uniqueId)) {
+            const p = String(n.uniqueId).split('|');
+            found = { vendor: (p[2] || '').toUpperCase(), index: parseInt(p[3], 10) };
+            return;
+        }
+        (n.assetNode || []).forEach(visit);
+    };
+    visit(node);
+    return found;
+}
+
 // Converts Crystal's refrigeration/HVAC asset hierarchies into the rack/circuit tree applyStoreData reads:
 // { value, label, key, children: [ { value: rackIndex, rackName, emsVendor, children: [circuit/module nodes] } ] }.
-// Returns null when the store has no racks or HVAC units.
-function crystalToHierarchy(storeId, refrigeration, hvac) {
+// Returns null when the store has no racks or HVAC units. Anything odd is reported through `warnings`.
+function crystalToHierarchy(storeId, refrigeration, hvac, warnings = []) {
     const walk = (node, fn) => {
         fn(node);
         (node.assetNode || []).forEach(child => walk(child, fn));
     };
     const racks = [];
+    const usedNames = new Set();
 
-    for (const rack of (refrigeration && refrigeration.assetNode) || []) {
-        if (rack.type !== 'Rack') continue;
+    // Rack nodes are found anywhere in the tree rather than only directly under the root.
+    const rackNodes = [];
+    const findRacks = node => {
+        if (/^rack$/i.test(node.type || '')) { rackNodes.push(node); return; }
+        (node.assetNode || []).forEach(findRacks);
+    };
+    if (refrigeration) findRacks(refrigeration);
+
+    for (const rack of rackNodes) {
         const props = rack.additionalProperties || {};
-        const rackIndex = parseInt(props.rackIndex !== undefined && props.rackIndex !== null ? props.rackIndex : rack.rackIndex, 10);
-        if (!Number.isFinite(rackIndex)) continue;
+        const rackLabel = String(props.rackLabel || rack.label || '').trim();
+        const owner = sensorOwner(rack);
 
-        const vendor = String(props.vendorType || '').toUpperCase();
+        let rackIndex = parseInt(props.rackIndex !== undefined && props.rackIndex !== null ? props.rackIndex : rack.rackIndex, 10);
+        if (!Number.isFinite(rackIndex) && owner && Number.isFinite(owner.index)) rackIndex = owner.index;
+        if (!Number.isFinite(rackIndex)) {
+            warnings.push(`Skipped rack "${rackLabel}" (${rack.id}): no rack index.`);
+            continue;
+        }
+
+        let vendor = parseCrystalVendor(props.vendorType);
+        let emsVendor = vendor.name;
+        if (!emsVendor && owner && owner.vendor) {
+            // vendorType was missing or a combination; the rack's own sensors say which controller it is.
+            emsVendor = CRYSTAL_VENDORS[owner.vendor] || owner.vendor;
+            warnings.push(`Rack "${rackLabel}": vendorType ${JSON.stringify(props.vendorType)} is ambiguous; using "${emsVendor}" from its sensor ids.`);
+        }
+        if (!emsVendor) {
+            emsVendor = String(props.vendorType || 'Unknown');
+            warnings.push(`Rack "${rackLabel}": could not determine the EMS vendor (vendorType ${JSON.stringify(props.vendorType)}).`);
+        }
+        const vendorLetter = vendor.letters[0] || (owner && owner.vendor) || '';
+
+        let rackName = rackLabel || `Rack ${rackIndex}`;
+        if (usedNames.has(rackName.toUpperCase())) {
+            const unique = `${rackName} ${rackIndex}`;
+            warnings.push(`Rack name "${rackName}" appears more than once; the later one is saved as "${unique}".`);
+            rackName = unique;
+        }
+        usedNames.add(rackName.toUpperCase());
+
         const children = [];
         const boards = new Set();
 
@@ -871,10 +948,10 @@ function crystalToHierarchy(storeId, refrigeration, hvac) {
 
         racks.push({
             value: rackIndex,
-            label: `${props.rackLabel || rack.label} (${CRYSTAL_VENDORS[vendor] || vendor || 'Unknown'})`,
-            key: `US|${storeId}|${vendor}|${rackIndex}`,
-            rackName: String(props.rackLabel || rack.label).trim(),
-            emsVendor: CRYSTAL_VENDORS[vendor] || vendor || 'Unknown',
+            label: `${rackName} (${emsVendor})`,
+            key: `US|${storeId}|${vendorLetter}|${rackIndex}|${rack.id}`,
+            rackName: rackName,
+            emsVendor: emsVendor,
             children: children
         });
     }
@@ -884,10 +961,14 @@ function crystalToHierarchy(storeId, refrigeration, hvac) {
     if (hvac && hvac.assetNode) {
         walk(hvac, n => {
             if (n.type !== 'HVAC Modules' || !n.label) return;
-            const rackIndex = parseInt(n.rackIndex, 10);
-            if (!Number.isFinite(rackIndex)) return;
-            const sensor = (n.assetNode || []).find(c => c.uniqueId);
-            const vendor = sensor ? String(sensor.uniqueId).split('|')[2] || '' : '';
+            const owner = sensorOwner(n);
+            let rackIndex = parseInt(n.rackIndex, 10);
+            if (!Number.isFinite(rackIndex) && owner && Number.isFinite(owner.index)) rackIndex = owner.index;
+            if (!Number.isFinite(rackIndex)) {
+                warnings.push(`Skipped HVAC module "${n.label}" (${n.id}): no rack index.`);
+                return;
+            }
+            const vendor = owner ? owner.vendor : '';
             const groupKey = `${vendor}|${rackIndex}`;
             if (!hvacGroups.has(groupKey)) hvacGroups.set(groupKey, { vendor, rackIndex, children: [] });
             hvacGroups.get(groupKey).children.push({
@@ -899,7 +980,6 @@ function crystalToHierarchy(storeId, refrigeration, hvac) {
             });
         });
     }
-    const usedNames = new Set(racks.map(r => r.rackName.toUpperCase()));
     [...hvacGroups.values()].sort((a, b) => a.rackIndex - b.rackIndex).forEach(g => {
         const vendor = String(g.vendor).toUpperCase();
         const emsVendor = CRYSTAL_VENDORS[vendor] || vendor || 'Unknown';
@@ -910,7 +990,7 @@ function crystalToHierarchy(storeId, refrigeration, hvac) {
         racks.push({
             value: g.rackIndex,
             label: `${name} (${emsVendor})`,
-            key: `US|${storeId}|${vendor}|${g.rackIndex}`,
+            key: `US|${storeId}|${vendor}|${g.rackIndex}|hvac`,
             rackName: name,
             emsVendor: emsVendor,
             children: g.children
@@ -921,21 +1001,130 @@ function crystalToHierarchy(storeId, refrigeration, hvac) {
     return { value: storeId, label: `Store ${storeId}`, key: `US|${storeId}`, children: racks };
 }
 
-async function scanStore(storeId) {
+// ----- Crystal JSON capture (debugging aid) -----
+// When enabled, every scanned store's raw Crystal responses, the converted tree and the saved racks are
+// written to Store_<n>_Crystal_Dump.json so the parsing can be checked against what Crystal really returned.
+const CAPTURE_KEY = 'emsMapperCrystalCapture';
+const crystalCapture = { enabled: localStorage.getItem(CAPTURE_KEY) === '1', dir: null, warnedNoTarget: false };
+
+function updateCaptureUi() {
+    const box = document.getElementById('capture-toggle');
+    const status = document.getElementById('capture-status');
+    if (!box || !status) return;
+    box.checked = crystalCapture.enabled;
+    document.getElementById('capture-folder-btn').style.display = crystalCapture.enabled && window.showDirectoryPicker ? 'inline-block' : 'none';
+    if (!crystalCapture.enabled) status.textContent = 'Off.';
+    else if (crystalCapture.dir) status.textContent = `On. Writing dump files to the folder "${crystalCapture.dir.name}".`;
+    else if (window.showDirectoryPicker) status.textContent = 'On. A folder is requested when you start a scan.';
+    else status.textContent = 'On. This browser cannot write to a folder, so each dump downloads as a file.';
+}
+
+function setCaptureEnabled(on) {
+    crystalCapture.enabled = on;
+    crystalCapture.warnedNoTarget = false;
+    localStorage.setItem(CAPTURE_KEY, on ? '1' : '0');
+    updateCaptureUi();
+}
+
+async function pickCaptureFolder() {
+    if (!window.showDirectoryPicker) return false;
+    try {
+        crystalCapture.dir = await window.showDirectoryPicker({ mode: 'readwrite' });
+        updateCaptureUi();
+        return true;
+    } catch (err) {
+        if (err.name !== 'AbortError') logMsg(`Could not open the capture folder: ${err.message}`, 'error');
+        return false;
+    }
+}
+
+async function writeCaptureFile(name, text) {
+    if (crystalCapture.dir) {
+        const fileHandle = await crystalCapture.dir.getFileHandle(name, { create: true });
+        const writable = await fileHandle.createWritable();
+        await writable.write(text);
+        await writable.close();
+        return;
+    }
+    const url = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 100);
+}
+
+// Scheduled scans have no user gesture to pick a folder, so they only capture when one is already chosen.
+function captureActive(unattended) {
+    return crystalCapture.enabled && (!unattended || !!crystalCapture.dir);
+}
+
+function savedRacksFor(storeId) {
+    const res = db.exec(`SELECT r.rack_name, r.ems_type, r.needs_review, r.host_address, COUNT(c.circuit_id)
+                         FROM Racks r LEFT JOIN Circuits c ON c.rack_id = r.rack_id
+                         WHERE r.store_id = ? GROUP BY r.rack_id ORDER BY r.rack_name`, [storeId]);
+    return res.length === 0 ? [] : res[0].values.map(r => ({ rack_name: r[0], ems_type: r[1], needs_review: r[2], host_address: r[3], circuits: r[4] }));
+}
+
+// Every node Crystal labels as a rack, for a quick check against what was saved.
+function rackNodeSummary(refrigeration) {
+    const out = [];
+    const visit = n => {
+        if (/rack/i.test(n.type || '') && !/Parts?$|Sensors$/i.test(n.type || '')) {
+            out.push({ id: n.id, label: n.label, type: n.type, rackIndex: n.rackIndex, rackIndexes: n.rackIndexes, additionalProperties: n.additionalProperties });
+        }
+        (n.assetNode || []).forEach(visit);
+    };
+    if (refrigeration) visit(refrigeration);
+    return out;
+}
+
+async function captureStoreDump(storeId, raw, hierarchy, warnings, saved) {
+    try {
+        let tabularRack = null;
+        try {
+            // Crystal's own rack list, handy for spotting racks missing from the hierarchy.
+            tabularRack = await crystalFetch(`/tabular-view/${storeId}/rack`);
+        } catch (err) {
+            tabularRack = { error: err.message };
+        }
+        const dump = {
+            capturedAt: new Date().toISOString(),
+            storeId: storeId,
+            rackNodesInHierarchy: rackNodeSummary(raw.refrigeration),
+            savedRacks: saved ? savedRacksFor(storeId) : null,
+            warnings: warnings,
+            convertedHierarchy: hierarchy,
+            crystal: { refrigeration: raw.refrigeration, hvac: raw.hvac, tabularRack: tabularRack }
+        };
+        await writeCaptureFile(`Store_${storeId}_Crystal_Dump.json`, JSON.stringify(dump, null, 1));
+    } catch (err) {
+        logMsg(`Store ${storeId}: could not write the Crystal dump: ${err.message}`, 'error');
+    }
+}
+
+async function scanStore(storeId, unattended) {
     try {
         const [refrigeration, hvac] = await Promise.all([
             crystalFetch(`/asset-hierarchy/${storeId}/refrigeration`),
             crystalFetch(`/asset-hierarchy/${storeId}/hvac`)
         ]);
 
-        const data = crystalToHierarchy(storeId, refrigeration, hvac);
+        const warnings = [];
+        const data = crystalToHierarchy(storeId, refrigeration, hvac, warnings);
+        warnings.forEach(w => logMsg(`Store ${storeId}: ${w}`, 'warn'));
+        const capture = captureActive(unattended);
+
         if (!data) {
             logMsg(`Store ${storeId} has no refrigeration or HVAC assets in Crystal. Marking as nonexistent.`, 'warn');
             markStoreMissing(storeId);
+            if (capture) await captureStoreDump(storeId, { refrigeration, hvac }, null, warnings, false);
             return;
         }
 
         saveStoreData(storeId, data);
+        if (capture) await captureStoreDump(storeId, { refrigeration, hvac }, data, warnings, true);
     } catch(err) {
         logMsg(`Store ${storeId} Failed: ${err.message}`, 'error');
         if (err instanceof CrystalAuthError) {
@@ -1137,7 +1326,9 @@ function applyStoreData(db, storeId, data) {
         const rackRes = db.exec("SELECT last_insert_rowid()");
         const rackId = rackRes[0].values[0][0];
         
-        rackValueToDbId[child.value] = rackId;
+        // Keyed by the node key so two racks sharing an index (different vendors) stay separate.
+        const rackKey = child.key !== undefined && child.key !== null ? child.key : child.value;
+        rackValueToDbId[rackKey] = rackId;
         hasRacks = true;
         
         // Insert circuits from rack nodes directly
@@ -1184,8 +1375,8 @@ function applyStoreData(db, storeId, data) {
                 cleanCName = cleanCName.split('/')[0].trim();
                 
                 circuitsToInsert.push({
-                    rack_val: child.value,
-                    hash: `${child.value}-${cleanCName}`,
+                    rack_val: rackKey,
+                    hash: `${rackKey}-${cleanCName}`,
                     circuit_name: cleanCName
                 });
             }
