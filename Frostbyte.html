@@ -13565,8 +13565,25 @@ verified in {SYSTEM}
                  storeInput.parentNode.insertBefore(link, storeInput);
              }
              
+             const dumpLink = document.createElement("a");
+             dumpLink.id = "mapper-dump-link";
+             dumpLink.text = "🗺️ Dump in EMS Mapper";
+             dumpLink.title = "Have the EMS Mapper fetch this store from Crystal, save it and write a JSON dump";
+             dumpLink.style = "font-size:12px; float:right; display:none; margin-right:10px; cursor:pointer;";
+             dumpLink.href = "#";
+             dumpLink.addEventListener("click", (ev) => {
+                 ev.preventDefault();
+                 requestMapperScan(storeInput.value.trim());
+             });
+             if (label) {
+                 label.appendChild(dumpLink);
+             } else {
+                 storeInput.parentNode.insertBefore(dumpLink, storeInput);
+             }
+
              storeInput.addEventListener("input", (e) => {
                 const val = e.target.value.trim();
+                dumpLink.style.display = val ? "inline-block" : "none";
                 if (val) {
                     link.style.display = "inline-block";
                     link.href = `https://crystal.walmart.com/us/stores/search/${encodeURIComponent(val)}`;
@@ -13577,6 +13594,7 @@ verified in {SYSTEM}
              
              // Fire event manually on load if there's already a value
              if (storeInput.value.trim()) {
+                 dumpLink.style.display = "inline-block";
                  link.style.display = "inline-block";
                  link.href = `https://crystal.walmart.com/us/stores/search/${encodeURIComponent(storeInput.value.trim())}`;
              }
@@ -14166,6 +14184,7 @@ verified in {SYSTEM}
              fn(window.mainDB);
              await saveToIndexedDB(window.mainDB.export());
          }
+         window.commitDb = commitDb;
 
          // ----- Opus Architect / Magnum classification -----
 
@@ -14632,6 +14651,122 @@ verified in {SYSTEM}
           }
       }
 
+      // ----- EMS Mapper requests -----
+      // Asks the EMS Mapper to fetch a store, save it and write a Crystal dump. An open Mapper tab answers over a
+      // BroadcastChannel; otherwise the Mapper is opened with #scan=<store>.
+      const MAPPER_URL_KEY = "emsMapperUrl";
+
+      async function requestMapperScan(storeId) {
+        if (!storeId) {
+          showNotification("Enter a store number first.", "error");
+          return;
+        }
+        let accepted = false;
+        const channel = "BroadcastChannel" in window ? new BroadcastChannel("frostbyte-ems-mapper") : null;
+        if (channel) {
+          channel.onmessage = (e) => {
+            const m = e.data || {};
+            if (String(m.storeId) !== String(storeId)) return;
+            if (m.type === "accepted") accepted = true;
+            if (m.type === "scanDone") {
+              showNotification(m.message || "EMS Mapper finished.", m.ok ? "success" : "error", 6000);
+              channel.close();
+              if (m.ok && typeof updateEmsInsightsPanel === "function") syncFromSharedSafe();
+            }
+          };
+          channel.postMessage({ type: "scanStore", storeId: storeId });
+        }
+        showNotification(`Asking the EMS Mapper to fetch store ${storeId}...`, "info", 2500);
+
+        await new Promise((resolve) => setTimeout(resolve, channel ? 1500 : 0));
+        if (accepted) return;
+
+        // No open Mapper answered, so open it.
+        let url = localStorage.getItem(MAPPER_URL_KEY);
+        if (!url) {
+          url = await customPrompt(
+            "No EMS Mapper tab answered. Enter the address of EMS_Mapper_Tool.html (it must be a page where the Tampermonkey proxy runs):",
+            new URL("EMS_Mapper_Tool.html", location.href).href,
+            "EMS Mapper Address",
+          );
+          if (!url || !url.trim()) return;
+          url = url.trim();
+          localStorage.setItem(MAPPER_URL_KEY, url);
+        }
+        const target = new URL(url, location.href);
+        target.hash = `scan=${encodeURIComponent(storeId)}`;
+        window.open(target.href, "_blank");
+        showNotification("Opened the EMS Mapper; it will fetch the store and write the dump.", "info", 4000);
+      }
+
+      // Pulls in the Mapper's changes when a shared database file is linked.
+      function syncFromSharedSafe() {
+        try { window.dispatchEvent(new Event("focus")); } catch (e) { /* ignore */ }
+      }
+
+      // ----- Manual mappings in the EMS database -----
+      // Maps the builder's short system names to the ems_type values the EMS Mapper stores.
+      const BUILDER_DB_TYPES = {
+        "Novar": "Novar",
+        "Opus Arch": "Opus Architect",
+        "Opus Mag": "Opus Magnum",
+        "CPC": "CPC Ultrasite",
+        "Ultrasite": "CPC Ultrasite",
+        "Emerson": "CPC Ultrasite",
+        "E2": "CPC Ultrasite",
+        "E3": "CPC Ultrasite",
+        "AKA65": "Danfoss AKA65",
+        "Danfoss": "Danfoss Storeview",
+        "Carel Boss": "Carel",
+        "Connect+": "Connect+",
+      };
+
+      function dbRacksForStore(storeId) {
+        try {
+          const res = window.mainDB.exec(
+            `SELECT r.rack_name, r.ems_type, GROUP_CONCAT(c.circuit_name) FROM Racks r
+             LEFT JOIN Circuits c ON r.rack_id = c.rack_id WHERE r.store_id = ? GROUP BY r.rack_id ORDER BY r.rack_name`,
+            [parseInt(storeId, 10)],
+          );
+          return res.length === 0 ? [] : res[0].values.map((v) => ({
+            name: String(v[0]), system: v[1], circuits: v[2] ? String(v[2]).split(",") : [],
+          }));
+        } catch (err) {
+          console.error("Failed to read racks", err);
+          return [];
+        }
+      }
+
+      // Adds (or updates) a rack, and any circuits, for a store, creating the store when it is not listed yet.
+      async function saveMappingToDb(storeId, rackName, system, circuits) {
+        const sid = parseInt(storeId, 10);
+        const emsType = BUILDER_DB_TYPES[system] || system;
+        try {
+          await window.commitDb((d) => {
+            d.run("INSERT OR IGNORE INTO Stores (store_id) VALUES (?)", [sid]);
+            try { d.run("DELETE FROM MissingStores WHERE store_id = ?", [sid]); } catch (e) { /* older files have no table */ }
+            const found = d.exec("SELECT rack_id FROM Racks WHERE store_id = ? AND UPPER(rack_name) = UPPER(?)", [sid, rackName]);
+            let rackId;
+            if (found.length > 0) {
+              rackId = found[0].values[0][0];
+              d.run("UPDATE Racks SET ems_type = ?, needs_review = 0 WHERE rack_id = ?", [emsType, rackId]);
+            } else {
+              d.run("INSERT INTO Racks (store_id, rack_name, ems_type, needs_review) VALUES (?, ?, ?, 0)", [sid, rackName, emsType]);
+              rackId = d.exec("SELECT last_insert_rowid()")[0].values[0][0];
+            }
+            circuits.forEach((c) => {
+              const has = d.exec("SELECT 1 FROM Circuits WHERE rack_id = ? AND UPPER(circuit_name) = UPPER(?)", [rackId, c]);
+              if (has.length === 0) d.run("INSERT INTO Circuits (rack_id, circuit_name) VALUES (?, ?)", [rackId, c]);
+            });
+          });
+          return true;
+        } catch (err) {
+          console.error("Failed to save mapping", err);
+          showNotification("Failed to save the mapping to the database.", "error");
+          return false;
+        }
+      }
+
       function openEmsMappingBuilder() {
         const storeInput = document.getElementById("store-number").value.trim();
         if (!storeInput) {
@@ -14823,7 +14958,27 @@ verified in {SYSTEM}
         
         const refreshResults = () => {
            resultsList.innerHTML = "";
-           if (frostbyteEmsMapping[storeInput] && frostbyteEmsMapping[storeInput].racks) {
+           if (window.mainDB) {
+             const rows = dbRacksForStore(storeInput);
+             rows.forEach(r => {
+               const div = document.createElement("div");
+               div.style.padding = "5px";
+               div.style.borderBottom = "1px solid rgba(255,255,255,0.1)";
+               const strong = document.createElement("strong");
+               strong.textContent = r.name;
+               div.appendChild(strong);
+               div.appendChild(document.createTextNode(` → ${r.system}`));
+               if (r.circuits.length > 0) {
+                 const cDiv = document.createElement("div");
+                 cDiv.style.fontSize = "0.85em";
+                 cDiv.style.color = "var(--text-secondary)";
+                 cDiv.style.paddingLeft = "10px";
+                 cDiv.textContent = `↳ Circuits: ${r.circuits.join(", ")}`;
+                 div.appendChild(cDiv);
+               }
+               resultsList.appendChild(div);
+             });
+           } else if (frostbyteEmsMapping[storeInput] && frostbyteEmsMapping[storeInput].racks) {
              const racks = frostbyteEmsMapping[storeInput].racks;
              Object.keys(racks).forEach(r => {
                const div = document.createElement("div");
@@ -14854,7 +15009,7 @@ verified in {SYSTEM}
         modalBody.appendChild(builderArea);
         modalBody.appendChild(resultsArea);
 
-        addBtn.onclick = () => {
+        addBtn.onclick = async () => {
            const rackName = rackInput.value.trim();
            const ems = emsSelect.value;
            const circuitName = circuitInput.value.trim();
@@ -14889,6 +15044,11 @@ verified in {SYSTEM}
            }
 
            saveEmsData();
+           if (window.mainDB) {
+             // The database is what the insights panel and table read once it is loaded.
+             const circuitList = circuitName.split(",").map(c => c.trim()).filter(c => c);
+             if (!(await saveMappingToDb(storeInput, rackName, ems, circuitList))) return;
+           }
            updateEmsInsightsPanel();
            renderEmsTable();
 

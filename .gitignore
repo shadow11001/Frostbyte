@@ -115,3 +115,14 @@ Frostbyte_v3/update_colors.py
 scripts/modularize_app.py
 scripts/split_app_js.py
 Frostbyte_v3/postcss.config.js
+development/refrigeration.txt
+development/EMSMap_Output/Store_189_Crystal_Dump.json
+development/EMSMap_Output/Store_359_Crystal_Dump.json
+development/EMSMap_Output/Store_633_Crystal_Dump.json
+development/EMSMap_Output/Store_1845_Crystal_Dump.json
+development/EMSMap_Output/Store_2749_Crystal_Dump.json
+development/EMSMap_Output/Store_2929_Crystal_Dump.json
+development/EMSMap_Output/Store_3493_Crystal_Dump.json
+development/EMSMap_Output/Store_3607_Crystal_Dump.json
+development/EMSMap_Output/Store_4165_Crystal_Dump.json
+development/EMSMap_Output/Store_5310_Crystal_Dump.json
