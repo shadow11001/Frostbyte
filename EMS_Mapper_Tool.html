@@ -118,7 +118,7 @@
                 <button class="secondary-button" id="capture-folder-btn" onclick="pickCaptureFolder()" style="display:none">📁 Choose Folder</button>
                 <span id="capture-status" style="color:#aaa;"></span>
             </div>
-            <p class="hint">Writes Store_&lt;n&gt;_Crystal_Dump.json with the raw refrigeration and HVAC responses, Crystal's own rack list, the converted racks, the racks actually saved and any parsing warnings. Scan a single store (start = end) to inspect one. Scheduled scans only capture once a folder has been chosen.</p>
+            <p class="hint">Writes Store_&lt;n&gt;_Crystal_Dump.json with the raw refrigeration, HVAC and v2 controller-list responses, Crystal's own rack list, the converted racks, the racks actually saved and any parsing warnings. Scan a single store (start = end) to inspect one. Scheduled scans only capture once a folder has been chosen.</p>
         </div>
 
         <div class="panel-card" id="shared-db-card">
@@ -280,7 +280,7 @@ let stopRequested = false;
 // Crystal authenticates with the browser's crystal.walmart.com session cookie (sent by the Tampermonkey proxy).
 const CRYSTAL_API = 'https://crystal.walmart.com/api/asset-browser/v1';
 const CRYSTAL_LOGIN_MSG = 'Not signed in to Crystal. Open https://crystal.walmart.com/ in this browser, sign in, then rescan.';
-const CRYSTAL_VENDORS = { O: 'OPUS', N: 'NOVAR', E: 'EMERSON', C: 'CAREL', D: 'DANFOSS' };
+const CRYSTAL_VENDORS = { O: 'OPUS', N: 'NOVAR', E: 'EMERSON', C: 'CAREL', D: 'DANFOSS', CO: 'COPELAND' };
 
 const SUPPORTED_EMS_TYPES = [
     'Danfoss AKA65', 'Danfoss Storeview',
@@ -986,7 +986,7 @@ function crystalToHierarchy(storeId, refrigeration, hvac, warnings = []) {
         const touched = new Set([primaryKey]);
 
         walk(rack, n => {
-            if (n.type === 'Circuit Names' && n.label) {
+            if (n.type === 'Circuit Names' && n.label && !isCircuitRange(n.label)) {
                 const key = topOwner(n) || primaryKey;
                 const c = controllerFor(key);
                 touched.add(key);
@@ -1085,6 +1085,135 @@ function crystalToHierarchy(storeId, refrigeration, hvac, warnings = []) {
     });
 
     if (racks.length === 0) return null;
+    return { value: storeId, label: `Store ${storeId}`, key: `US|${storeId}`, children: racks };
+}
+
+// ----- Crystal v2 controller list -----
+// /asset-hierarchy/v2/<store> lists every controller with its real name, e.g. { id: "US|4906|O|7", label: "CLTA (OPUS)" },
+// plus a "Cases" group. It is the authority for controller names, vendors and indexes; the refrigeration and HVAC
+// hierarchies still supply the circuit names, which are matched to a controller through their sensor ids.
+
+// "RACK MTB (+18) (NOVAR)" -> { name: "RACK MTB (+18)", type: "NOVAR" }; only the last bracket is the vendor.
+function parseControllerLabel(label) {
+    const clean = String(label || '').replace(/\s*\(\s*COMM LOSS\s*\)/ig, '').trim();
+    const m = clean.match(/^(.*\S)\s*\(([^()]*)\)$/);
+    return m ? { name: m[1].trim(), type: m[2].trim() } : { name: clean, type: '' };
+}
+
+// Circuit name from a module label such as "A06a MT SFD CASE" -> "A6", "A7.1 DT CFN" -> "A7.1", "RG08 OPTICAL" -> "RG08".
+function circuitFromModule(moduleLabel, category) {
+    const label = String(moduleLabel || '').trim();
+    if (category === 'hvac') {
+        const h = label.match(/^(RE\d+|RG\d+|RC\d+|AHU\d+|AHM\d+|AHMCU\S*)/i);
+        return h ? h[1].toUpperCase() : '';
+    }
+    if (/^(XIO|ROM|RIM|CCM|COM|CIM|EIM|XCM|MINIO|NCH|SQD|IOM)/i.test(label)) return '';
+    const c = label.match(/^([A-Z]{1,3}S?\d+(?:\.\d+)?)[a-z]?(?:\s|$)/);
+    return c ? c[1].replace(/^([A-Z]+)0+(?=\d)/, '$1') : '';
+}
+
+function controllerKeyOf(node) {
+    const m = String(node.id || '').match(/^[A-Z]{2}\|[^|]+\|([A-Z]+)\|(\d+)$/);
+    return m ? `${m[1]}|${parseInt(m[2], 10)}` : null;
+}
+
+// Crystal also lists circuit ranges such as "E1-E6" or "E01-E06"; the individual circuits are listed separately.
+function isCircuitRange(name) {
+    return /^([A-Z]{1,3})0*\d+[A-Za-z]?\s*-\s*\1?0*\d+/i.test(String(name).trim());
+}
+
+// Circuits per controller from the refrigeration / HVAC hierarchies: Map("O|2") -> Map(name -> node).
+function hierarchyCircuits(refrigeration, hvac) {
+    const byController = new Map();
+    const add = (key, name, node) => {
+        if (!key || !name || isCircuitRange(name)) return;
+        if (!byController.has(key)) byController.set(key, new Map());
+        const m = byController.get(key);
+        if (!m.has(name.toUpperCase())) m.set(name.toUpperCase(), { label: name, key: node.id, category: 'circuit', circuitName: name, modLabelForGrouping: name });
+    };
+    const visit = (n, isHvac) => {
+        if (n.type === 'Circuit Names' && n.label) add(topOwner(n), n.label, n);
+        if (isHvac && n.type === 'HVAC Modules' && n.label) add(topOwner(n), n.label.split(/\s+/)[0], n);
+        (n.assetNode || []).forEach(c => visit(c, isHvac));
+    };
+    if (refrigeration) visit(refrigeration, false);
+    if (hvac) visit(hvac, true);
+    return byController;
+}
+
+// Returns null when v2 lists no controllers.
+function crystalV2ToHierarchy(storeId, v2, refrigeration, hvac, warnings = []) {
+    const top = (v2 && v2.assetNode) || [];
+    const controllers = new Map();
+
+    for (const node of top) {
+        const key = controllerKeyOf(node);
+        if (!key) continue;
+        const [vendor, index] = key.split('|');
+        const parsed = parseControllerLabel(node.label);
+        if (controllers.has(key)) {
+            warnings.push(`Controller ${key} is listed more than once in Crystal v2; the entries are merged.`);
+        }
+        const c = controllers.get(key) || { key, vendor, index: parseInt(index, 10), name: parsed.name, labelType: parsed.type, sensors: [] };
+        c.sensors.push(...(node.assetNode || []));
+        controllers.set(key, c);
+    }
+    if (controllers.size === 0) return null;
+
+    // The "Cases" group (and any stray group) holds case sensors whose controller is in their sensor id.
+    for (const node of top) {
+        if (controllerKeyOf(node)) continue;
+        for (const sensor of node.assetNode || []) {
+            const p = String(sensor.uniqueId || '').split('|');
+            const key = p.length > 3 ? `${p[2]}|${parseInt(p[3], 10)}` : null;
+            if (key && controllers.has(key)) controllers.get(key).sensors.push(sensor);
+            else if (key) warnings.push(`Sensor ${sensor.uniqueId} belongs to controller ${key}, which Crystal v2 does not list; ignored.`);
+        }
+    }
+
+    const fromHierarchy = hierarchyCircuits(refrigeration, hvac);
+    const racks = [];
+    const usedNames = new Set();
+
+    for (const c of [...controllers.values()].sort((a, b) => a.index - b.index)) {
+        const emsVendor = CRYSTAL_VENDORS[c.vendor] || c.labelType.toUpperCase() || c.vendor || 'Unknown';
+        if (!CRYSTAL_VENDORS[c.vendor]) warnings.push(`Controller ${c.key}: unknown vendor letter "${c.vendor}"; using "${emsVendor}".`);
+
+        let name = c.name || `${emsVendor} ${c.index}`;
+        if (usedNames.has(name.toUpperCase())) {
+            const unique = `${name} ${c.index}`;
+            warnings.push(`Controller ${c.key} is also named "${name}"; saved as "${unique}".`);
+            name = unique;
+        }
+        usedNames.add(name.toUpperCase());
+
+        // Circuits: the hierarchies' own circuit names when they have any for this controller, else derived from the module labels.
+        const circuits = new Map(fromHierarchy.get(c.key) || []);
+        const boards = new Set();
+        c.sensors.forEach(sensor => {
+            const tel = String(sensor.telemetryLabel || '');
+            const moduleLabel = tel.includes('|') ? tel.split('|').pop().trim() : '';
+            if (moduleLabel) boards.add(moduleLabel);
+            if (fromHierarchy.has(c.key)) return;
+            const derived = circuitFromModule(moduleLabel, sensor.category);
+            if (derived && !circuits.has(derived.toUpperCase())) {
+                circuits.set(derived.toUpperCase(), { label: derived, key: `${c.key}|${derived}`, category: 'circuit', circuitName: derived, modLabelForGrouping: derived });
+            }
+        });
+
+        // Board entries let applyStoreData detect an XCM20R (Opus Architect); the 'rack' category keeps them out of the circuit list.
+        const children = [...circuits.values()];
+        boards.forEach(b => children.push({ label: b, key: `US|${storeId}|${c.key}|${b}`, category: 'rack', modLabelForGrouping: b }));
+
+        racks.push({
+            value: c.index,
+            label: `${name} (${emsVendor})`,
+            key: `US|${storeId}|${c.vendor}|${c.index}`,
+            rackName: name,
+            emsVendor: emsVendor,
+            children: children
+        });
+    }
     return { value: storeId, label: `Store ${storeId}`, key: `US|${storeId}`, children: racks };
 }
 
@@ -1192,7 +1321,7 @@ async function captureStoreDump(storeId, raw, hierarchy, warnings, saved) {
             savedRacks: saved ? savedRacksFor(storeId) : null,
             warnings: warnings,
             convertedHierarchy: hierarchy,
-            crystal: { refrigeration: raw.refrigeration, hvac: raw.hvac, tabularRack: tabularRack, tabularOther: tabularOther }
+            crystal: { refrigeration: raw.refrigeration, hvac: raw.hvac, v2: raw.v2, tabularRack: tabularRack, tabularOther: tabularOther }
         };
         await writeCaptureFile(`Store_${storeId}_Crystal_Dump.json`, JSON.stringify(dump, null, 1));
     } catch (err) {
@@ -1202,25 +1331,35 @@ async function captureStoreDump(storeId, raw, hierarchy, warnings, saved) {
 
 async function scanStore(storeId, unattended, opts = {}) {
     try {
-        const [refrigeration, hvac] = await Promise.all([
+        const warnings = [];
+        const [refrigeration, hvac, v2] = await Promise.all([
             crystalFetch(`/asset-hierarchy/${storeId}/refrigeration`),
-            crystalFetch(`/asset-hierarchy/${storeId}/hvac`)
+            crystalFetch(`/asset-hierarchy/${storeId}/hvac`),
+            // The v2 list is optional: if it fails the controllers are derived from the other two responses.
+            crystalFetch(`/asset-hierarchy/v2/${storeId}`).catch(err => {
+                if (err instanceof CrystalAuthError) throw err;
+                warnings.push(`Crystal v2 controller list unavailable (${err.message}); controller names were derived.`);
+                return null;
+            })
         ]);
 
-        const warnings = [];
-        const data = crystalToHierarchy(storeId, refrigeration, hvac, warnings);
+        let data = crystalV2ToHierarchy(storeId, v2, refrigeration, hvac, warnings);
+        if (!data) {
+            if (v2) warnings.push('Crystal v2 listed no controllers; controller names were derived.');
+            data = crystalToHierarchy(storeId, refrigeration, hvac, warnings);
+        }
         warnings.forEach(w => logMsg(`Store ${storeId}: ${w}`, 'warn'));
         const capture = captureActive(unattended, opts.forceCapture);
 
         if (!data) {
             logMsg(`Store ${storeId} has no refrigeration or HVAC assets in Crystal. Marking as nonexistent.`, 'warn');
             markStoreMissing(storeId);
-            if (capture) await captureStoreDump(storeId, { refrigeration, hvac }, null, warnings, false);
+            if (capture) await captureStoreDump(storeId, { refrigeration, hvac, v2 }, null, warnings, false);
             return;
         }
 
         saveStoreData(storeId, data);
-        if (capture) await captureStoreDump(storeId, { refrigeration, hvac }, data, warnings, true);
+        if (capture) await captureStoreDump(storeId, { refrigeration, hvac, v2 }, data, warnings, true);
     } catch(err) {
         logMsg(`Store ${storeId} Failed: ${err.message}`, 'error');
         if (err instanceof CrystalAuthError) {
@@ -1269,11 +1408,11 @@ function applyStoreData(db, storeId, data) {
     if (historyRes.length > 0) {
         historyRes[0].values.forEach(row => {
             historicalRacks[row[0].toUpperCase()] = { type: row[1], review: row[2] };
-            (historicalByHost[row[3] || ''] = historicalByHost[row[3] || ''] || []).push({ name: row[0], type: row[1] });
+            (historicalByHost[row[3] || ''] = historicalByHost[row[3] || ''] || []).push({ name: row[0], type: row[1], review: row[2] });
         });
     }
 
-    // Crystal does not name HVAC or circuit controllers, so Crystal-generated names are replaced by the name already
+    // When the controller list had to be derived (no Crystal v2 list), generated names are replaced by the name already
     // stored for the same host and vendor (e.g. HVACL, AHM, BASC). Names Crystal supplies itself are kept.
     const vendorKey = t => {
         const u = String(t || '').toUpperCase();
@@ -1302,6 +1441,9 @@ function applyStoreData(db, storeId, data) {
             nameOverrides.set(child, `${child.rackName} ${child.value}`);
         }
     }
+
+    // Names being saved this scan; an old rack with one of these names is not a rename candidate.
+    const newNames = new Set(data.children.map(ch => String(nameOverrides.get(ch) || ch.rackName || ch.label || '').toUpperCase()));
 
     // Clear out old racks and circuits for this store so that modifications/deletions 
     // on the API side are correctly reflected locally.
@@ -1398,7 +1540,13 @@ function applyStoreData(db, storeId, data) {
         let needsReview = 0;
         
         // Inherit manual selections from historical scans to protect user overrides
-        const historicalMatch = historicalRacks[rawRackName.toUpperCase()];
+        // A controller renamed since the last scan (e.g. LTA 7 -> CLTA) keeps its classification via its host and vendor.
+        let historicalMatch = historicalRacks[rawRackName.toUpperCase()];
+        if (!historicalMatch) {
+            const sameHost = (historicalByHost[hostOf(child)] || []).find(h =>
+                h.review === 0 && vendorKey(h.type) === vendorKey(rawEmsType) && !newNames.has(h.name.toUpperCase()));
+            if (sameHost) historicalMatch = { type: sameHost.type, review: 0 };
+        }
         if (historicalMatch && historicalMatch.review === 0) {
             // User previously verified this and assigned a permanent type
             processedEmsType = historicalMatch.type;
